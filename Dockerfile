@@ -37,7 +37,7 @@ ARG CLOAK_BINARY_SHA256=4a12bcde95fa1bb1beef2b41ab5e5c27c36be78e3be3d0dac8c64d70
 # 国内 ACR/CNB 构建节点直连 github.com 下载 207MB 大文件经常极慢/超时,
 # 默认开启常用加速镜像; 仍失败请在 ACR 构建参数里换用自建源或其它可用代理。
 ARG CLOAK_DOWNLOAD_URL=""
-ARG CLOAK_DOWNLOAD_MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/"
+ARG CLOAK_DOWNLOAD_MIRRORS="https://gh.07150721.xyz/ https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/"
 # 单个下载源的总超时(秒): 加速镜像一般几分钟内完成, 官方直连慢时会卡满此值
 ARG CLOAK_DOWNLOAD_TIMEOUT=600
 # 是否安装 headed 模式依赖(Xvfb/openbox/xdotool), 默认不装(镜像更小)
