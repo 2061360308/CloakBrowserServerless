@@ -60,8 +60,10 @@ stealth Chromium，再由一个 **Python WS 代理** 把真实的浏览器控制
 # 构建镜像(默认 headless; 可用 --build-arg CLOAKBROWSER_VERSION=0.5.10 锁版本)
 docker build -t cloakbrowser-ws-proxy:local .
 
-# 国内网络构建节点(docker.io 不稳定)可通过构建 ARG 覆盖基础镜像/pip/apt 源:
-#   --build-arg PYTHON_IMAGE=<registry>/library/python:3.12-slim
+# 基础镜像/pip/apt 默认均已走国内源(DaoCloud Docker Hub 代理 + 阿里云 pip/apt),
+# 不依赖 docker.io, 可直接在 CNB / 阿里云 ACR 等国内构建节点构建; 仍可按需覆盖:
+#   --build-arg PYTHON_IMAGE=python:3.12-slim                        # 切回官方源
+#   --build-arg PYTHON_IMAGE=mirror.ccs.tencentyun.com/library/python:3.12-slim  # 腾讯云内网源
 #   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
 #   --build-arg APT_MIRROR=mirrors.tencentyun.com
 

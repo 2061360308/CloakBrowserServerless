@@ -14,15 +14,15 @@
 #   - 默认 headless 模式(无需 Xvfb), 适配阿里云函数计算等无头平台;
 #     需要 headed 模式时: docker build --build-arg ENABLE_HEADED=true
 #
-# 国内网络构建适配(针对 CNB/腾讯云等国内构建节点 docker.io 拉取超时):
+# 国内网络构建适配(针对 CNB/腾讯云/阿里云 ACR 等国内构建节点 docker.io 拉取超时):
 #   - 不使用 # syntax=docker/dockerfile:1(该指令会额外从 docker.io 拉取
 #     BuildKit 前端镜像, 国内构建机易超时); 本 Dockerfile 未用到其扩展语法。
-#   - 基础镜像与 pip 源均走国内可替换入口(ARG / 环境变量), 默认值可在
-#     构建时覆盖:
-#        docker build --build-arg PYTHON_IMAGE=... \
-#                     --build-arg PIP_INDEX_URL=...
+#   - 基础镜像默认走 DaoCloud 的 Docker Hub 公共代理(docker.m.daocloud.io),
+#     国内节点普遍可达, 不再依赖 docker.io; 仍可用 --build-arg PYTHON_IMAGE 覆盖:
+#        --build-arg PYTHON_IMAGE=python:3.12-slim                                # 切回官方源
+#        --build-arg PYTHON_IMAGE=mirror.ccs.tencentyun.com/library/python:3.12-slim  # 腾讯云内网
 # =============================================================================
-ARG PYTHON_IMAGE=python:3.12-slim
+ARG PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
 FROM ${PYTHON_IMAGE}
 
 # 上游 wrapper 版本(PyPI 包版本), 用于锁定构建可复现性
