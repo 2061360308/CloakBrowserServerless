@@ -1,0 +1,34 @@
+services:
+  cloakbrowser:
+    build:
+      context: .
+    image: cloakbrowser-ws-proxy:local
+    container_name: cloakbrowser
+    ports:
+      # 对外 WS/CDP 端口(容器内 python 代理监听 0.0.0.0:9000)
+      - "9000:9000"
+    environment:
+      BROWSER_HEADLESS: "true"     # 默认无头(无需 Xvfb); false 需 ENABLE_HEADED=true 重建
+      # FINGERPRINT_SEED: "12345"  # 固定 stealth 指纹/身份; 留空则每次随机
+      # CLOAK_TIMEZONE: "Asia/Shanghai"
+      # CLOAK_LOCALE: "zh-CN"
+      # PROXY: "http://user:pass@host:port"
+      # EXTRA_BROWSER_ARGS: "--lang=zh-CN"
+    volumes:
+      # 固定 FINGERPRINT_SEED 时, 挂载持久化 profile 保留登录态/cookie
+      - cloak-profile:/data
+    restart: unless-stopped
+    healthcheck:
+      # GET / 恒 200(供平台探活); 用 /json/version 判定浏览器真正就绪
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/json/version', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  cloak-profile:
