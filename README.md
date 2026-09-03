@@ -8,8 +8,9 @@ stealth Chromium，再由一个 **Python WS 代理** 把真实的浏览器控制
 
 ## 许可证与密钥说明
 
-- CloakBrowser Python wrapper 为 **MIT 开源**，本仓库不打包上游源码，
-  构建时按固定 tag（默认 `v0.5.10`，可用构建 ARG 覆盖）从 GitHub 拉取。
+- CloakBrowser Python wrapper 为 **MIT 开源**（发布在 PyPI 的 `cloakbrowser`
+  包），本仓库按固定版本（默认 `0.5.10`，可用构建 ARG 覆盖）从 PyPI 安装，
+  不依赖 GitHub。
 - 未配置任何密钥（keyless）时，wrapper 自动下载并校验**免费版 Chromium
   v146**，**无需密钥、无需登录**，构建期即预下载进镜像层。
 - 若需要 Pro/新版浏览器，可自行设置 `CLOAKBROWSER_LICENSE_KEY` 等，
@@ -56,8 +57,13 @@ stealth Chromium，再由一个 **Python WS 代理** 把真实的浏览器控制
 ## 构建与运行
 
 ```bash
-# 构建镜像(默认 headless; 可用 --build-arg CLOAKBROWSER_REF=v0.5.10 锁版本)
+# 构建镜像(默认 headless; 可用 --build-arg CLOAKBROWSER_VERSION=0.5.10 锁版本)
 docker build -t cloakbrowser-ws-proxy:local .
+
+# 国内网络构建节点(docker.io 不稳定)可通过构建 ARG 覆盖基础镜像/pip/apt 源:
+#   --build-arg PYTHON_IMAGE=<registry>/library/python:3.12-slim
+#   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
+#   --build-arg APT_MIRROR=mirrors.tencentyun.com
 
 # 需要 headed(可视化)模式: 多装 Xvfb/openbox
 docker build --build-arg ENABLE_HEADED=true -t cloakbrowser-ws-proxy:local .
