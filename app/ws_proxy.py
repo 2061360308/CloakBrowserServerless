@@ -4,9 +4,10 @@
 监听 0.0.0.0:<PROXY_PORT>(默认 9000), 后端为 127.0.0.1:<CDP_PORT> 上以
 remote debugging 启动的 stealth Chromium。支持:
 
-  - GET /json/version  -> 转发浏览器版本信息, 并把 webSocketDebuggerUrl
-                          的 host 重写为客户端视角的地址
-  - GET /json/list     -> 转发页面/目标列表(同样重写)
+  - GET /json/version  -> 转发浏览器版本信息; webSocketDebuggerUrl 返回
+                          无实例状态的稳定入口 ws(s)://<host>/(根路径,
+                          由代理动态解析当前浏览器), 跨实例/重启均有效
+  - GET /json/list     -> 转发页面/目标列表(重写 host, 保留 target uuid)
   - WS  /devtools/<type>/<id> -> 双向转发到浏览器同名 CDP WebSocket
   - WS  /(根路径)      -> 双向转发到 browser-level CDP WebSocket
                           (方便裸 ws 客户端直接连 ws://host:9000)
@@ -184,18 +185,33 @@ def _text_response(connection: ServerConnection, status: int,
 
 
 def _rewrite_ws_url(headers: Headers, ws_url: str) -> str:
-    """把后端返回的 ws://127.0.0.1:9222/... 重写为对外可达地址。"""
+    """把后端返回的 ws://127.0.0.1:9222/... 重写为对外可达地址。
+
+    保留 /devtools/<type>/<id> 路径, 供 /json/list 的页面 target 使用
+    (DevTools 调试需要精确到实例内某个 target; 同实例内必然存在)。
+    """
     tail = ws_url.split("/devtools/", 1)
     if len(tail) != 2:
         return ws_url
     return f"{_ws_scheme(headers)}://{_external_host(headers)}/devtools/{tail[1]}"
 
 
+def _stable_browser_ws(headers: Headers) -> str:
+    """浏览器级 CDP 稳定入口(根路径), 不含任何实例本地状态。
+
+    代理收到根路径 WS 时动态解析当前浏览器真实的 webSocketDebuggerUrl
+    (见 route_ws), 因此该地址与"具体实例/浏览器进程"解耦 —— FC 弹性
+    扩容把请求调度到别的实例、或浏览器崩溃重启(uuid 每次随机)后依然
+    有效, 消除"先取地址后连接"两步落在不同实例时的 uuid 失配。
+    """
+    return f"{_ws_scheme(headers)}://{_external_host(headers)}/"
+
+
 async def _version_payload(cdp_port: int, headers: Headers) -> dict:
     data = await _fetch_json(cdp_port, "/json/version")
-    ws_url = data.get("webSocketDebuggerUrl", "")
-    if ws_url:
-        data["webSocketDebuggerUrl"] = _rewrite_ws_url(headers, ws_url)
+    if data.get("webSocketDebuggerUrl"):
+        # 返回稳定根路径而非带随机 uuid 的具体地址, 见 _stable_browser_ws
+        data["webSocketDebuggerUrl"] = _stable_browser_ws(headers)
     return data
 
 
@@ -220,8 +236,7 @@ async def _health_payload(cdp_port: int, headers: Headers) -> dict:
     try:
         version = await _fetch_json(cdp_port, "/json/version")
         body["browser"] = version.get("Browser", "")
-        body["browser_ws"] = _rewrite_ws_url(
-            headers, version.get("webSocketDebuggerUrl", ""))
+        body["browser_ws"] = _stable_browser_ws(headers)
         body["browser_status"] = "ready"
     except Exception as exc:  # noqa: BLE001
         body["browser_status"] = "starting"
