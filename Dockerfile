@@ -44,8 +44,9 @@ ARG CLOAK_DOWNLOAD_TIMEOUT=600
 ARG ENABLE_HEADED=false
 # pip 镜像源(默认阿里云; 也可换腾讯云/清华源)
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
-# apt 镜像源(默认阿里云 debian 源)
-ARG APT_MIRROR=mirrors.aliyun.com
+# apt 镜像源(默认中科大 debian 源 http://mirrors.ustc.edu.cn/debian; 也可换清华/腾讯云源)
+# 仅填域名即可: 下方 sed 会整站替换 deb.debian.org / security.debian.org
+ARG APT_MIRROR=mirrors.ustc.edu.cn
 
 # ---- 1. 系统运行库(Chromium 最小依赖集, 不含中文字体/emoji 等大字体) -------
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
