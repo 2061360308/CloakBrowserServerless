@@ -93,14 +93,22 @@ RUN set -eux; \
     done; \
     [ "${ok}" = "1" ] || { echo "所有下载源均失败, 请换 CLOAK_DOWNLOAD_URL/MIRRORS" >&2; exit 1; }; \
     echo "${CLOAK_BINARY_SHA256}  /tmp/cb.tar.gz" | sha256sum -c -; \
-    mkdir -p /opt/cloakbrowser; \
-    tar -xzf /tmp/cb.tar.gz -C /tmp; \
     rm -f /tmp/cb.tar.gz; \
-    chrome="$(find /tmp -maxdepth 4 -type f -name chrome -perm -u+x | head -n 1)"; \
+    mkdir -p /tmp/cb_extract /opt/cloakbrowser; \
+    tar -xzf /tmp/cb.tar.gz -C /tmp/cb_extract; \
+    chrome="$(find /tmp/cb_extract -maxdepth 6 -type f -name chrome -perm -u+x | head -n 1)"; \
     test -n "${chrome}" || { echo "chrome binary not found in archive" >&2; exit 1; }; \
-    mv "${chrome}" /opt/cloakbrowser/chrome; \
+    chromedir="$(dirname "${chrome}")"; \
+    echo "==> chrome binary: ${chrome}"; \
+    echo "==> chromedir files:"; ls -la "${chromedir}"; \
+    # Chromium 非自包含: 必须与 icudtl.dat/.pak/locales/ 等辅助文件同目录,
+    # 只拷 chrome 单文件会在启动时因缺 ICU 数据崩溃(SIGTRAP)。整目录平铺拷贝。
+    cp -a "${chromedir}/." /opt/cloakbrowser/; \
     chmod +x /opt/cloakbrowser/chrome; \
-    rm -rf /tmp/*; \
+    rm -rf /tmp/cb_extract; \
+    test -f /opt/cloakbrowser/icudtl.dat \
+      || { echo "致命: /opt/cloakbrowser 下缺少 icudtl.dat(Chromium 启动必需), 请检查发布包布局" >&2; exit 1; }; \
+    echo "==> /opt/cloakbrowser:"; ls -la /opt/cloakbrowser | head -30; \
     echo "==> binary check:"; /opt/cloakbrowser/chrome --version
 
 # ---- 3. 唯一的第三方 Python 依赖: websockets(HTTP/WS 代理) ------------------
