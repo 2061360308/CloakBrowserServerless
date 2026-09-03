@@ -257,10 +257,11 @@ async def _process_request(
         return None  # 进入 WS handler(route_ws 按 path 转发)
 
     try:
-        if path == "/json/version":
+        # 兼容 Playwright connect_over_cdp: 它会自动请求 /json/version/(带尾斜杠)
+        if path in ("/json/version", "/json/version/"):
             return _json_response(connection, 200,
                                   await _version_payload(cdp_port, headers))
-        if path in ("/json/list", "/json"):
+        if path in ("/json/list", "/json/list/", "/json"):
             return _json_response(connection, 200,
                                   await _list_payload(cdp_port, headers))
         return _text_response(connection, 404)
