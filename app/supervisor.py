@@ -3,7 +3,7 @@
 浏览器生命周期(懒启动):
   容器启动时**不再预启动浏览器**, 只把 WS 代理监听起来 —— 健康检查
   GET / 恒 200, FC 立即判定实例启动成功; 浏览器由首个 GET /start
-  (携带 sessionID header, 内含浏览器参数)按需创建/复用/切换。
+  (携带 sessionID + X-Browser-Cfg 头)按需创建/复用/切换。
   WS 断开后浏览器进程保留复用(同 session 重连直接命中), 由 FC 空闲
   回收实例兜底清理。
 
@@ -20,8 +20,9 @@
   BROWSER_READY_TIMEOUT  浏览器就绪超时秒数(懒启动冷启动), 默认 90
   PROFILE_DIR          客户端传固定 seed 时的 profile 目录; 默认 /data/profile
 
-浏览器指纹参数(seed/timezone/locale/proxy/extra_args)一律由客户端
-sessionID header 下发, 不再使用 FINGERPRINT_SEED 等环境变量注入。
+浏览器指纹参数(seed/timezone/locale/proxy/extra_args)一律由客户端在
+X-Browser-Cfg header 下发(sessionID 仅是 FC 亲和会话 ID), 不再使用
+FINGERPRINT_SEED 等环境变量注入。
 """
 from __future__ import annotations
 
@@ -90,7 +91,7 @@ async def main() -> None:
 
     logger.info(
         "配置: headless=%s, PROXY_PORT=%s, CDP_PORT=%s, "
-        "BROWSER_READY_TIMEOUT=%ss (浏览器参数由客户端 sessionID 下发)",
+        "BROWSER_READY_TIMEOUT=%ss (浏览器参数由客户端 X-Browser-Cfg 头下发)",
         headless, proxy_port, cdp_port, ready_timeout,
     )
 
@@ -116,7 +117,8 @@ async def main() -> None:
     await asyncio.sleep(0)
     logger.info(
         "WS 代理已监听 0.0.0.0:%d -> 127.0.0.1:%d; 浏览器懒启动: "
-        "首个 GET /start(携带 sessionID header)按需创建", proxy_port, cdp_port,
+        "首个 GET /start(携带 sessionID + X-Browser-Cfg 头)按需创建",
+        proxy_port, cdp_port,
     )
 
     # ---------------- 阶段 2: 守护 + 优雅停机 ------------------------------

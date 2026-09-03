@@ -193,7 +193,7 @@ class StealthBrowser:
 
 
 # ---------------------------------------------------------------------------
-# 按客户端 sessionID(内含浏览器配置)懒启动/复用/切换的管理器
+# 按客户端会话(sessionID 身份 + X-Browser-Cfg 配置)懒启动/复用/切换的管理器
 # ---------------------------------------------------------------------------
 class BrowserBusy(Exception):
     """当前浏览器正被其他会话占用, 无法按新配置切换。"""
@@ -222,19 +222,21 @@ def normalize_cfg(raw: dict) -> dict:
 
 
 class BrowserManager:
-    """单个实例内的浏览器门(gate): 按 cfg 懒启动/复用/切换 stealth Chromium。
+    """单个实例内的浏览器门(gate): 按会话懒启动/复用/切换 stealth Chromium。
 
     设计前提: 同一时刻一个活跃会话(FC 单实例并发=1 天然保证), 同实例内
-    最多一个浏览器进程(内存约束)。语义:
+    最多一个浏览器进程(内存约束)。语义(以 sessionID 为会话身份, 配置由
+    X-Browser-Cfg 头下发, 见 ws_proxy._handle_start):
 
-      - 相同 cfg 再次请求   -> 复用当前进程;
-      - 无进程              -> 按 cfg 启动并等待 CDP 就绪;
-      - 不同 cfg 且空闲     -> 停旧启新;
-      - 不同 cfg 但有活跃 WS -> 抛 BrowserBusy(409), 不踢人;
-      - 进程崩溃            -> supervisor watchdog 按当前 cfg 自动重启。
+      - 相同 sessionID 再次请求    -> 复用当前进程(同会话重连直接命中);
+      - 无进程                     -> 按配置启动并等待 CDP 就绪;
+      - 不同 sessionID 且空闲      -> 停旧启新(按新配置重建浏览器);
+      - 不同 sessionID 但有活跃 WS -> 抛 BrowserBusy(409), 不踢人;
+      - 进程崩溃                   -> supervisor watchdog 按当前配置重启
+                                      (sessionID 不变, 亲和仍命中本实例)。
 
-    浏览器由客户端 GET /start 的 sessionID header 决定, 容器启动时不再
-    预启动; 断连后进程保留复用, 由 FC 空闲回收实例兜底清理。
+    浏览器由客户端 GET /start 决定, 容器启动时不再预启动; 断连后进程保留
+    复用, 由 FC 空闲回收实例兜底清理。
     """
 
     def __init__(
@@ -249,6 +251,7 @@ class BrowserManager:
         self._lock = asyncio.Lock()
         self._browser: StealthBrowser | None = None
         self._cfg: dict | None = None
+        self._sid: str | None = None
 
     @property
     def browser(self) -> StealthBrowser | None:
@@ -257,6 +260,11 @@ class BrowserManager:
     def chrome_exists(self) -> bool:
         """是否已创建浏览器进程(含启动中/已就绪)。代理据此快速失败/等待。"""
         return self._browser is not None
+
+    @property
+    def current_session_id(self) -> str | None:
+        """当前浏览器所属会话 ID(代理层据此防跨会话误连)。"""
+        return self._sid
 
     def _running(self) -> bool:
         b = self._browser
@@ -280,24 +288,28 @@ class BrowserManager:
         return {"status": "ready", "seed": self._cfg.get("seed") if self._cfg else None}
 
     # ------------------------------------------------------------------
-    async def ensure(self, cfg_raw: dict, active_ws: int = 0) -> dict:
-        """确保存在与 cfg 匹配且 CDP 就绪的浏览器; 返回状态 dict。"""
+    async def ensure(self, session_id: str, cfg_raw: dict,
+                     active_ws: int = 0) -> dict:
+        """确保存在与 session_id 匹配且 CDP 就绪的浏览器; 返回状态 dict。"""
         cfg = normalize_cfg(cfg_raw)
         async with self._lock:
-            if self._running() and self._cfg == cfg:
-                logger.info("浏览器配置一致, 直接复用: %s", cfg)
+            if self._running() and self._sid == session_id:
+                logger.info("会话 %s 复用当前浏览器", session_id)
             elif self._running():
                 if active_ws > 0:
-                    raise BrowserBusy("浏览器正被其他会话使用且配置不同, 无法切换")
-                logger.info("切换浏览器配置: %s -> %s", self._cfg, cfg)
+                    raise BrowserBusy(
+                        "浏览器正被其他会话占用且配置不同, 无法切换")
+                logger.info("切换会话: %s -> %s (浏览器按新配置重建)",
+                            self._sid, session_id)
                 await self._stop_locked()
-                self._start_locked(cfg)
+                self._start_locked(session_id, cfg)
             else:
-                self._start_locked(cfg)
+                self._start_locked(session_id, cfg)
             await self._wait_ready_locked()
             return self._describe()
 
-    def _start_locked(self, cfg: dict) -> None:
+    def _start_locked(self, session_id: str, cfg: dict) -> None:
+        self._sid = session_id
         self._cfg = cfg
         self._browser = self._new_browser(cfg)
         self._browser.start()
@@ -307,6 +319,7 @@ class BrowserManager:
             await asyncio.to_thread(self._browser.stop)
         self._browser = None
         self._cfg = None
+        self._sid = None
 
     async def _wait_ready_locked(self) -> None:
         assert self._browser is not None
@@ -331,6 +344,7 @@ class BrowserManager:
                 logger.exception("浏览器重启失败, 标记为不可用(下次请求时重建)")
                 self._browser = None
                 self._cfg = None
+                self._sid = None
 
     async def stop(self) -> None:
         async with self._lock:

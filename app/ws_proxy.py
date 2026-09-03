@@ -4,8 +4,10 @@
 监听 0.0.0.0:<PROXY_PORT>(默认 9000), 后端为 127.0.0.1:<CDP_PORT> 上以
 remote debugging 启动的 stealth Chromium。支持:
 
-  - GET /start          -> 懒启动入口: 读取 sessionID header(内含 base64url
-                           JSON 浏览器配置), 启动/复用/切换对应浏览器后返回
+  - GET /start          -> 懒启动入口: 携带两个头 —— sessionID(FC HeaderField
+                           亲和会话 ID, 1-64 字符、^[A-Za-z0-9_-]*$) +
+                           X-Browser-Cfg(base64url JSON 浏览器配置); 服务端
+                           启动/复用/切换对应浏览器后返回
                            {"status":"ready","ws": 稳定根地址}; 供后续直连
   - GET /json/version  -> 转发浏览器版本信息; webSocketDebuggerUrl 返回
                           无实例状态的稳定入口 ws(s)://<host>/(根路径,
@@ -17,7 +19,8 @@ remote debugging 启动的 stealth Chromium。支持:
   - GET /              -> 健康检查(恒 200, 供 FC 探活)
 
 浏览器生命周期: 不再于容器启动时预启动, 而是由首个 GET /start 按客户端
-sessionID 懒启动; WS 断开后进程保留复用, 由 FC 空闲回收实例兜底清理。
+sessionID(配置在 X-Browser-Cfg 头)懒启动; WS 断开后进程保留复用, 由 FC
+空闲回收实例兜底清理。
 serve() 可传入一个 BrowserManager(gate) 提供 /start 能力与"浏览器是否已
 创建"判定; gate 为 None 时行为与旧版一致(假定后端浏览器已由外部启动)。
 
@@ -66,6 +69,13 @@ _TRUSTED_ORIGINS = {
 
 _MAX_MSG_SIZE = 64 * 1024 * 1024  # CDP 大消息(如 DOM snapshot)需要 64MB 上限
 _REQUEST_TIMEOUT = 2.0            # 后端 localhost 请求超时(秒)
+
+# 客户端两个自定义头:
+#  - sessionID: FC HeaderField 亲和会话 ID(1-64 字符 ^[A-Za-z0-9_-]*$),
+#    平台对值长度/字符集有硬限制, 因此只放"会话身份"(客户端取配置的 sha256);
+#  - X-Browser-Cfg: 完整浏览器配置(base64url JSON), 只在 GET /start 携带。
+_SID_HEADER = "sessionid"          # 查找时统一小写
+_CFG_HEADER = "x-browser-cfg"      # 查找时统一小写
 
 
 # ---------------------------------------------------------------------------
@@ -228,15 +238,24 @@ def _header_value(headers: Headers, name: str) -> str | None:
     return None
 
 
-def _decode_session(sid: str) -> dict | None:
-    """把 sessionID(base64url 编码的 JSON 对象)解码为配置 dict; 失败返回 None。"""
+def _decode_cfg_header(headers: Headers) -> tuple[dict, str | None]:
+    """读取 X-Browser-Cfg(base64url JSON)为配置 dict。
+
+    返回 (cfg, err): 头缺失 -> ({}, None)(= 服务端默认随机配置);
+    解码失败/非对象 -> ({}, 错误提示)。
+    """
+    value = _header_value(headers, _CFG_HEADER)
+    if value is None:
+        return {}, None
     try:
-        b = sid.encode("ascii")
+        b = value.encode("ascii")
         raw = base64.urlsafe_b64decode(b + b"=" * (-len(b) % 4))
         cfg = json.loads(raw.decode("utf-8"))
-    except Exception:  # noqa: BLE001 - 任何解码失败一律视为非法 sessionID
-        return None
-    return cfg if isinstance(cfg, dict) else None
+    except Exception:  # noqa: BLE001 - 任何解码失败一律视为非法配置头
+        return {}, "X-Browser-Cfg 解码失败: 须为 base64url 编码的 JSON 对象"
+    if not isinstance(cfg, dict):
+        return {}, "X-Browser-Cfg 解码结果必须是 JSON 对象(dict)"
+    return cfg, None
 
 
 async def _version_payload(cdp_port: int, headers: Headers) -> dict:
@@ -269,7 +288,8 @@ async def _health_payload(cdp_port: int, headers: Headers,
     # 懒启动模式: 浏览器尚未创建时如实标注并给提示(仍返回 200, FC 探活不受影响)
     if gate is not None and not gate.chrome_exists():
         body["browser_status"] = "not_created"
-        body["hint"] = "GET /start 并携带 sessionID header 以按需启动浏览器"
+        body["hint"] = ("GET /start 并携带 sessionID + X-Browser-Cfg 头"
+                        "以按需启动浏览器")
         return body
     try:
         version = await _fetch_json(cdp_port, "/json/version")
@@ -292,31 +312,36 @@ async def _handle_start(
     gate: Any,
     active_ws: int,
 ) -> Response:
-    """按 sessionID header(base64url JSON 浏览器配置)确保浏览器就绪。
+    """按两个头确保浏览器就绪: sessionID(会话身份) + X-Browser-Cfg(配置)。
+
+    sessionID 为 FC HeaderField 亲和会话 ID(1-64 字符 ^[A-Za-z0-9_-]*$),
+    本身不含配置; 浏览器参数由 X-Browser-Cfg(base64url JSON)下发, 缺失时
+    走服务端默认随机配置。
 
     成功返回 200 {"status":"ready","ws":<稳定根地址>,"seed":...,"browser":...};
-    失败: 400(缺/坏 header) / 409(浏览器正被占用且配置不同) /
+    失败: 400(缺 sessionID / 配置头解码失败) / 409(浏览器被其他活跃会话占用) /
           503(启动超时或失败)。
     """
-    sid = _header_value(request.headers, "sessionid")
+    sid = _header_value(request.headers, _SID_HEADER)
     if not sid:
         return _json_response(connection, 400, {
             "error": "missing sessionID header",
-            "hint": "sessionID = base64url(JSON of browser config), "
-                    "e.g. {seed,timezone,locale,proxy,extra_args}",
+            "hint": "sessionID = FC HeaderField 亲和会话 ID(1-64 字符, "
+                    "^[A-Za-z0-9_][A-Za-z0-9_-]*$); 浏览器配置请放 "
+                    "X-Browser-Cfg header(base64url JSON)",
         })
-    cfg = _decode_session(sid)
-    if cfg is None:
+    cfg, err = _decode_cfg_header(request.headers)
+    if err is not None:
         return _json_response(connection, 400, {
-            "error": "sessionID 解码失败",
-            "hint": "sessionID 必须是 base64url 编码的 JSON 对象",
+            "error": err,
+            "hint": "浏览器配置键: seed/timezone/locale/proxy/extra_args",
         })
     try:
-        status = await gate.ensure(cfg, active_ws)
+        status = await gate.ensure(sid, cfg, active_ws)
     except BrowserBusy as exc:
         return _json_response(connection, 409, {"error": str(exc)})
     except Exception as exc:  # noqa: BLE001
-        logger.error("浏览器按 sessionID 启动失败: %s", exc)
+        logger.error("浏览器按会话 %s 启动失败: %s", sid, exc)
         return _json_response(connection, 503, {
             "error": "browser startup failed", "detail": str(exc),
         })
@@ -327,7 +352,8 @@ async def _handle_start(
         body["browser"] = version.get("Browser", "")
     except Exception:  # noqa: BLE001
         body["browser"] = ""
-    logger.info("/start 完成: 配置=%s, active_ws=%s", body.get("seed"), active_ws)
+    logger.info("/start 完成: session=%s seed=%s, active_ws=%s",
+                sid, body.get("seed"), active_ws)
     return _json_response(connection, 200, body)
 
 
@@ -366,8 +392,20 @@ async def _process_request(
     if gate is not None and not gate.chrome_exists():
         return _json_response(connection, 503, {
             "error": "browser not created",
-            "hint": "call GET /start with a sessionID header first",
+            "hint": "call GET /start with sessionID(+X-Browser-Cfg) headers first",
         })
+    # 会话一致性防串台: HeaderField 亲和保证同会话落在同实例, 但扩容/切换
+    # 的瞬间可能出现"别的会话请求误入本实例"。此时快速 409 让客户端重试
+    # (换实例), 绝不拿本实例浏览器去服务别的会话。
+    if gate is not None and gate.chrome_exists():
+        cur = getattr(gate, "current_session_id", None)
+        req_sid = _header_value(headers, _SID_HEADER)
+        if cur and req_sid and req_sid != cur:
+            return _json_response(connection, 409, {
+                "error": f"session mismatch: 本实例正服务会话 {cur[:12]}…, "
+                         f"请求属于 {req_sid[:12]}…",
+                "hint": "HeaderField 亲和应避免跨会话路由; 请重试或重新 GET /start",
+            })
     if not await _wait_browser_ready(cdp_port):
         return _json_response(connection, 503, {
             "error": "browser not ready after timeout",

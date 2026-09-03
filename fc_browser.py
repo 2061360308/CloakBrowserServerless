@@ -20,11 +20,20 @@
 
     sess.destroy()                            # FC SDK DeleteSession 停掉该实例
 
-设计语义:
+设计语义(FC HeaderField 亲和对 sessionID 值有硬限制: 1-64 字符且字符集为
+^[A-Za-z0-9_][A-Za-z0-9_-]*$, 塞不下整份配置, 因此分两个头):
+  - sessionID = sha256( canonical JSON(cfg + 序号键 seq) ) 的 64 位 hex:
+    只作为 FC 亲和会话 ID(同时也是 ListSessions / DeleteSession 的对象),
+    单向不可解回配置;
+  - X-Browser-Cfg = base64url(JSON 浏览器配置), 只在 GET /start 携带,
+    服务端据此启动/重建浏览器并记忆 sessionID;
   - create() = 提供构建 sessionID 的参数; 会先 ListSessions 查询该 sessionID
-    是否已有存活实例; 若有(上次未销毁/未回收), 就给配置字典里的序号键 seq
-    自增重建 sessionID -> HeaderField 亲和路由会落到全新实例;
-  - 之后 GET /start(携带最终 sessionID)等浏览器就绪, 返回稳定 ws 根地址;
+    是否已有存活实例; 若有(上次未销毁/未回收), 就给序号键 seq 自增重建
+    sessionID -> HeaderField 亲和路由激发全新实例;
+  - 之后 GET /start(携带 sessionID + X-Browser-Cfg 两个头)等浏览器就绪,
+    返回稳定 ws 根地址;
+  - Playwright 直连只需带 sessionID 头(亲和保证落到同实例, 服务端据此
+    复用/防串台), 不需要再传配置;
   - destroy() 通过 FC SDK DeleteSession 停掉对应会话的实例。
 
 依赖(仅 aliyun SDK 部分需要, 已惰性导入):
@@ -38,6 +47,7 @@ ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET 或
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -48,30 +58,38 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-#: sessionID header 名(服务端大小写不敏感读取, 客户端统一此写法)
+#: sessionID header 名(FC HeaderField 亲和会话 ID; 服务端大小写不敏感读取)
 SESSION_HEADER = "sessionID"
-#: 服务端会话配置中作为「序号」的键, 服务端 normalize 时会忽略未知键, 只用于区分会话
+#: 浏览器配置 header 名(base64url JSON; 只在 GET /start 携带)
+CFG_HEADER = "X-Browser-Cfg"
+#: 配置字典里的「序号」键: 服务端 normalize 会忽略未知键, 它只参与哈希
+#: (seq 不同 -> sessionID 不同 -> FC 亲和路由激发新实例), 不会下发到浏览器
 _SEQ_KEY = "seq"
 
 
 def build_session_id(cfg: dict) -> str:
-    """浏览器配置 dict -> sessionID header 值(base64url(JSON))。
+    """浏览器配置 dict(+seq) -> sessionID(64 位 sha256 hex)。
 
-    编码方式与 test_fc_browser.py / 服务端 _decode_session 完全一致。
+    FC HeaderField 亲和键限制: 值 1-64 字符、字符集 ^[A-Za-z0-9_-]*$,
+    整份配置塞不下, 故 sessionID 只取哈希(与客户端 create()/服务端均一致)::
+
+        sid = sha256( utf8( json.dumps(cfg, ensure_ascii=False,
+                                       sort_keys=True) ) ).hexdigest()
+
+    同 cfg+seq 恒等; 单向不可解回配置 —— 原配置由 create() 内部保留在
+    BrowserSession.cfg, 并随 GET /start 的 X-Browser-Cfg 头发给服务端。
     """
     raw = json.dumps(cfg, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode_cfg_header(base_cfg: dict) -> str:
+    """浏览器配置(不含 seq/None 值) -> X-Browser-Cfg header 值(base64url JSON)。
+
+    自定义 header 无 FC 的 1-64/字符集限制, 可安全携带完整配置。
+    """
+    raw = json.dumps(base_cfg, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
-
-
-def decode_session_id(sid: str) -> Optional[dict]:
-    """sessionID -> 原配置 dict; 解码失败返回 None。"""
-    try:
-        b = sid.encode("ascii")
-        raw = base64.urlsafe_b64decode(b + b"=" * (-len(b) % 4))
-        cfg = json.loads(raw.decode("utf-8"))
-    except Exception:  # noqa: BLE001
-        return None
-    return cfg if isinstance(cfg, dict) else None
 
 
 def _derive_ws_url(public_base: str) -> str:
@@ -141,7 +159,7 @@ class BrowserSession:
         """停掉本会话在 FC 侧的实例。"""
         return self.manager.destroy(self.session_id)
 
-    def __repr__(self) -> str:  # 避免误打印 sessionID(可被解码出敏感配置)
+    def __repr__(self) -> str:  # 避免误打印 sessionID(会话凭据)
         return (f"<BrowserSession seq={self.seq} ws={self.ws_url} "
                 f"cfg_keys={sorted(k for k in self.cfg if k != _SEQ_KEY)}>")
 
@@ -271,34 +289,27 @@ class FcBrowser:
     # ------------------------------------------------------------------
     # 创建会话(核心)
     # ------------------------------------------------------------------
-    def create(self, cfg: dict, seq_start: int = 0, force_new: bool = True,
-               reuse: bool = False) -> BrowserSession:
+    def create(self, cfg: dict, seq_start: int = 0,
+               force_new: bool = True) -> BrowserSession:
         """创建一个已就绪的专属会话实例。
 
         参数:
           cfg      : 浏览器配置(seed/timezone/locale/proxy/extra_args 等),
-                     即「构建 sessionID 的参数」。None/空值会被剔除。
+                     即「构建 sessionID 的参数」。None/空值与 seq 键会被剔除;
+                     原样配置会随 GET /start 的 X-Browser-Cfg 头发给服务端。
           seq_start: 序号键起点(默认 0)。通常不需要改。
-          force_new: True(默认)= 若相同参数构造出的 sessionID 已有存活实例,
-                     则给配置字典的序号键 seq 自增, 直到构建出「无存活实例」
-                     的新 sessionID -> FC 亲和路由激发全新实例。
-          reuse    : True 时不再无条件开新实例: 若已存在「非 seq 参数一致」
-                     的存活会话, 直接复用其 sessionID(不调 /start, 立即可用)。
+          force_new: True(默认)= 若相同参数(+seq)构造出的 sessionID 已有存活
+                     实例, 则 seq 自增重建 sessionID, 直到「无存活实例」 ->
+                     FC 亲和路由激发全新实例。
 
         返回 BrowserSession(已 GET /start 成功、浏览器就绪)。
         """
         base = {k: v for k, v in cfg.items() if v is not None and k != _SEQ_KEY}
-
-        if reuse:
-            hit = self._find_reusable(base)
-            if hit is not None:
-                print(f"[FcBrowser] 命中存活会话直接复用: {hit}")
-                return BrowserSession(
-                    manager=self, session_id=hit, ws_url=_derive_ws_url(self.public_base),
-                    cfg=decode_session_id(hit) or dict(base))
+        cfg_b64 = encode_cfg_header(base)
 
         seq = int(seq_start or 0)
         sid = ""
+        trial: dict[str, Any] = {}
         while True:
             trial = dict(base)
             trial[_SEQ_KEY] = seq
@@ -309,39 +320,20 @@ class FcBrowser:
             seq += 1
 
         print(f"[FcBrowser] 请求 /start(seq={seq}, sid_len={len(sid)}) ...")
-        body = self._request_start(sid)
+        body = self._request_start(sid, cfg_b64)
         ws = body.get("ws") or _derive_ws_url(self.public_base)
         print(f"[FcBrowser] /start 就绪: browser={body.get('browser', '')} ws={ws}")
         return BrowserSession(manager=self, session_id=sid, ws_url=ws,
-                              cfg=decode_session_id(sid) or trial)
-
-    def _find_reusable(self, base_cfg: dict) -> Optional[str]:
-        """在存活会话中找「非 seq 配置一致」的一个, 返回其 sessionID。"""
-        try:
-            items = self.list_sessions()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[FcBrowser] 查询可复用会话失败, 走新建: {exc}")
-            return None
-        if any("_raw" in it for it in items):
-            return None  # 结构无法解析, 放弃复用
-        wanted = {k: v for k, v in base_cfg.items() if v is not None}
-        for it in items:
-            sid = it.get("session_id")
-            if not sid:
-                continue
-            dec = decode_session_id(sid) or {}
-            dec_no_seq = {k: v for k, v in dec.items() if k != _SEQ_KEY and v is not None}
-            if dec_no_seq == wanted:
-                return sid
-        return None
+                              cfg=dict(trial))
 
     # ------------------------------------------------------------------
     # GET /start(HTTP)
     # ------------------------------------------------------------------
-    def _request_start(self, sid: str) -> dict:
+    def _request_start(self, sid: str, cfg_b64: str) -> dict:
         url = f"{self.public_base}/start"
         req = urllib.request.Request(
-            url, headers={SESSION_HEADER: sid}, method="GET")
+            url, headers={SESSION_HEADER: sid, CFG_HEADER: cfg_b64},
+            method="GET")
         try:
             with urllib.request.urlopen(req, timeout=self.http_timeout) as resp:
                 return json.load(resp)
