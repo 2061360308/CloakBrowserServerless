@@ -77,8 +77,12 @@ docker build -t cloakbrowser-ws-proxy:local .
 #   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
 #   --build-arg APT_MIRROR=mirrors.tencentyun.com
 
-# Chromium 二进制约 207MB(tar.gz), 从 GitHub Releases 下载; 若构建节点访问
-# GitHub 慢, 可先自行下载后内网自建镜像/预置本地, 再替换下载 URL。
+# Chromium 二进制约 207MB(tar.gz)。下载源默认逐个 fallback:
+#   自定义 URL -> 常用 GitHub 加速镜像(ghfast.top/gh-proxy.com/ghproxy.net)
+#   -> 官方直链; 已内置 sha256 校验。若默认镜像在构建节点不可达, 可覆盖:
+#   --build-arg CLOAK_DOWNLOAD_URL=<自建 OSS/内网完整下载 URL>
+#   --build-arg CLOAK_DOWNLOAD_MIRRORS="https://ghfast.top/ https://gh-proxy.com/"
+#   --build-arg CLOAK_DOWNLOAD_TIMEOUT=600      # 单源总超时(秒)
 
 # 需要 headed(可视化)模式: 多装 Xvfb/openbox
 docker build --build-arg ENABLE_HEADED=true -t cloakbrowser-ws-proxy:local .

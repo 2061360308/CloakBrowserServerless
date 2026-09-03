@@ -29,6 +29,17 @@ FROM ${PYTHON_IMAGE}
 ARG CLOAK_CHROMIUM_VERSION=146.0.7680.177.5
 # 官方 release asset 的 sha256(构建期校验, 防下载被篡改)
 ARG CLOAK_BINARY_SHA256=4a12bcde95fa1bb1beef2b41ab5e5c27c36be78e3be3d0dac8c64d705216670e
+# Chromium 下载源(逐个 fallback, 直到成功):
+#   1. CLOAK_DOWNLOAD_URL    完整自定义 URL(自建内网/OSS 镜像最优先)
+#   2. CLOAK_DOWNLOAD_MIRRORS  GitHub 加速镜像前缀列表(空格分隔), 依次拼在官方
+#      直链前尝试, 例: https://ghfast.top/ https://gh-proxy.com/
+#   3. 官方直链 https://github.com/... (最后兜底)
+# 国内 ACR/CNB 构建节点直连 github.com 下载 207MB 大文件经常极慢/超时,
+# 默认开启常用加速镜像; 仍失败请在 ACR 构建参数里换用自建源或其它可用代理。
+ARG CLOAK_DOWNLOAD_URL=""
+ARG CLOAK_DOWNLOAD_MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/"
+# 单个下载源的总超时(秒): 加速镜像一般几分钟内完成, 官方直连慢时会卡满此值
+ARG CLOAK_DOWNLOAD_TIMEOUT=600
 # 是否安装 headed 模式依赖(Xvfb/openbox/xdotool), 默认不装(镜像更小)
 ARG ENABLE_HEADED=false
 # pip 镜像源(默认阿里云; 也可换腾讯云/清华源)
@@ -58,11 +69,29 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
 
 # ---- 2. 下载免费版 stealth Chromium(GitHub Release, 构建期预置进镜像) ------
 # 运行时不再联网; 解压后二进制固定在 /opt/cloakbrowser/chrome
+# 下载源依次尝试: 自定义 URL -> 加速镜像 -> 官方直链, 全部失败才报错退出
 RUN set -eux; \
     tag="chromium-v${CLOAK_CHROMIUM_VERSION}"; \
-    url="https://github.com/CloakHQ/CloakBrowser/releases/download/${tag}/cloakbrowser-linux-x64.tar.gz"; \
-    echo "==> downloading ${url}"; \
-    curl -fL --retry 3 --retry-delay 2 -o /tmp/cb.tar.gz "${url}"; \
+    path="CloakHQ/CloakBrowser/releases/download/${tag}/cloakbrowser-linux-x64.tar.gz"; \
+    github_url="https://github.com/${path}"; \
+    urls=""; \
+    if [ -n "${CLOAK_DOWNLOAD_URL}" ]; then urls="${CLOAK_DOWNLOAD_URL}"; fi; \
+    if [ -n "${CLOAK_DOWNLOAD_MIRRORS}" ]; then \
+      for m in ${CLOAK_DOWNLOAD_MIRRORS}; do urls="${urls} ${m}${github_url}"; done; \
+    fi; \
+    urls="${urls} ${github_url}"; \
+    ok=0; \
+    for u in ${urls}; do \
+      echo "==> 尝试下载: ${u}"; \
+      if curl -fL --connect-timeout 15 --max-time "${CLOAK_DOWNLOAD_TIMEOUT}" \
+           --retry 2 --retry-delay 2 -o /tmp/cb.tar.gz "${u}" \
+         && echo "${CLOAK_BINARY_SHA256}  /tmp/cb.tar.gz" | sha256sum -c - >/dev/null 2>&1; then \
+        echo "==> 下载成功且 sha256 校验通过: ${u}"; ok=1; break; \
+      else \
+        echo "==> 该源失败(下载错误或校验不符), 换下一个源..."; \
+      fi; \
+    done; \
+    [ "${ok}" = "1" ] || { echo "所有下载源均失败, 请换 CLOAK_DOWNLOAD_URL/MIRRORS" >&2; exit 1; }; \
     echo "${CLOAK_BINARY_SHA256}  /tmp/cb.tar.gz" | sha256sum -c -; \
     mkdir -p /opt/cloakbrowser; \
     tar -xzf /tmp/cb.tar.gz -C /tmp; \
