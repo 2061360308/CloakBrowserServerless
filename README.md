@@ -6,15 +6,23 @@ stealth Chromium，再由一个 **Python WS 代理** 把真实的浏览器控制
 `0.0.0.0:9000`，供外部 CDP 客户端接入。**默认 headless(无头)模式**，
 无需 Xvfb/显示环境，可直接部署到阿里云函数计算等无头平台。
 
-## 许可证与密钥说明
+## 许可证与体积(极简)说明
 
-- CloakBrowser Python wrapper 为 **MIT 开源**（发布在 PyPI 的 `cloakbrowser`
-  包），本仓库按固定版本（默认 `0.5.10`，可用构建 ARG 覆盖）从 PyPI 安装，
-  不依赖 GitHub。
-- 未配置任何密钥（keyless）时，wrapper 自动下载并校验**免费版 Chromium
-  v146**，**无需密钥、无需登录**，构建期即预下载进镜像层。
-- 若需要 Pro/新版浏览器，可自行设置 `CLOAKBROWSER_LICENSE_KEY` 等，
-  本仓库默认按免费 keyless 构建。
+- **二进制来源**：CloakBrowser 免费版 **stealth Chromium v146**（keyless，
+  无需密钥、无需登录）发布在其官方
+  [GitHub Releases](https://github.com/CloakHQ/CloakBrowser/releases/tag/chromium-v146.0.7680.177.5)
+  上（asset: `cloakbrowser-linux-x64.tar.gz`）。本镜像在**构建期**直接下载
+  该二进制并做 sha256 校验，预置进镜像层（运行时不再联网）。
+- **零 wrapper / 零驱动**：不使用 CloakBrowser 的 Python wrapper（其源码
+  MIT 开源，但其元数据强制绑定 playwright 等一堆依赖）。stealth 启动参数
+  经源码核实就是默认三件套 `--no-sandbox --fingerprint=<seed>
+  --fingerprint-platform=windows`（外加可选的时区/语言/代理），由
+  `app/browser.py` **原生生成**。
+- **镜像内第三方 Python 依赖只有 `websockets` 一个**（HTTP 探活/列表转发
+  用 Python 标准库 `urllib` 实现），**没有 playwright、没有 aiohttp、
+  没有 wrapper**。
+- 若需要 Pro/新版浏览器，可自行替换 GitHub Release 版本并更新
+  `CLOAK_BINARY_SHA256` 构建 ARG；本仓库默认按免费 keyless 构建。
 
 ## 架构
 
@@ -45,7 +53,7 @@ stealth Chromium，再由一个 **Python WS 代理** 把真实的浏览器控制
 服务成功启动后，如果浏览器在运行中崩溃并自动重启：
 
 - `GET /`（健康检查/探活）：仍即时返回 200（实例存活，FC 不会误杀），
-  body 内 `browser_status=restarting`。
+  body 内 `browser_status=starting/ready`。
 - `GET /json/version`、`GET /json/list`、`/devtools/...` WS、根路径 WS 等
   **业务端点**：浏览器未就绪时**自动阻塞等待**（默认最长 180 秒，
   可用 `WAIT_BROWSER_TIMEOUT` 调整），就绪后立即返回真实数据——
@@ -57,15 +65,20 @@ stealth Chromium，再由一个 **Python WS 代理** 把真实的浏览器控制
 ## 构建与运行
 
 ```bash
-# 构建镜像(默认 headless; 可用 --build-arg CLOAKBROWSER_VERSION=0.5.10 锁版本)
+# 构建镜像(默认 headless; 固定 chromium-v146.0.7680.177.5 + sha256 校验)
 docker build -t cloakbrowser-ws-proxy:local .
 
 # 基础镜像/pip/apt 默认均已走国内源(DaoCloud Docker Hub 代理 + 阿里云 pip/apt),
 # 不依赖 docker.io, 可直接在 CNB / 阿里云 ACR 等国内构建节点构建; 仍可按需覆盖:
 #   --build-arg PYTHON_IMAGE=python:3.12-slim                        # 切回官方源
 #   --build-arg PYTHON_IMAGE=mirror.ccs.tencentyun.com/library/python:3.12-slim  # 腾讯云内网源
+#   --build-arg CLOAK_CHROMIUM_VERSION=146.0.7680.177.5              # 浏览器版本
+#   --build-arg CLOAK_BINARY_SHA256=<对应 asset 的 sha256>            # 下载校验(勿改错)
 #   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
 #   --build-arg APT_MIRROR=mirrors.tencentyun.com
+
+# Chromium 二进制约 207MB(tar.gz), 从 GitHub Releases 下载; 若构建节点访问
+# GitHub 慢, 可先自行下载后内网自建镜像/预置本地, 再替换下载 URL。
 
 # 需要 headed(可视化)模式: 多装 Xvfb/openbox
 docker build --build-arg ENABLE_HEADED=true -t cloakbrowser-ws-proxy:local .
@@ -195,7 +208,7 @@ docker push registry.cn-hangzhou.aliyuncs.com/<ns>/cloakbrowser:latest
 ## 文件结构
 
 ```
-Dockerfile            # 系统依赖(可选 headed) + wrapper + 预下载二进制
+Dockerfile            # GitHub Release 下载 Chromium + 系统依赖(可选 headed) + websockets
 entrypoint.sh         # headless 直通; headed 才拉起 Xvfb/openbox
 app/
   supervisor.py       # 编排: 浏览器就绪 -> 监听 9000 -> 守护/优雅停机
@@ -205,5 +218,6 @@ docker-compose.yml    # 本地编排 + 健康检查 + 持久化卷
 ```
 
 > 注：本仓库独立实现了一个"单浏览器 + 固定端口转发"的精简代理，未直接
-> 使用官方 `cloakserve`(它按需多实例 seed 管理，模型不同)。核心 stealth
-> 参数/指纹/下载逻辑复用 MIT wrapper，二者可并行使用。
+> 使用官方 `cloakserve`（它按需多实例 seed 管理，模型不同）。stealth 参数
+> 与免费版 Chromium 二进制直接取自 CloakBrowser 上游（MIT 开源、GitHub
+> Release 分发），但**不引入其 Python wrapper 的任何运行时依赖**。

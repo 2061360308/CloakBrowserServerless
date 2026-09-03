@@ -1,8 +1,15 @@
 """浏览器进程管理: 以 remote debugging(远程调用)模式启动 CloakBrowser
-stealth Chromium, 并等待 CDP HTTP 接口就绪。
+免费版 stealth Chromium, 并等待 CDP HTTP 接口就绪。
 
-设计参考上游 cloakserve: 浏览器仅监听 127.0.0.1:<CDP_PORT>,
-不直接对外暴露; 由 WS 代理负责对外转发。
+零依赖设计: 不引入任何 Python wrapper/驱动。Chromium 二进制由 Dockerfile
+构建期从 CloakBrowser 官方 GitHub Release 下载(v146, keyless)并预置在
+/opt/cloakbrowser/chrome; stealth 启动参数按上游默认集(经源码核实)原生
+生成, 核心只有:
+    --no-sandbox --fingerprint=<seed> --fingerprint-platform=windows
+(可选: --fingerprint-timezone / --fingerprint-locale / --lang /
+ --proxy-server / --start-maximized)
+
+浏览器仅监听 127.0.0.1:<CDP_PORT>, 不直接对外暴露; 由 WS 代理负责对外转发。
 """
 from __future__ import annotations
 
@@ -17,12 +24,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-from cloakbrowser.browser import build_args
-from cloakbrowser.download import ensure_binary
-
 logger = logging.getLogger("cbapp.browser")
 
-# 容器默认以 root 运行, Chromium 需要 --no-sandbox
+# 容器默认以 root 运行, Chromium 需要 --no-sandbox(见 stealth 默认集)
 BASE_CHROME_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
@@ -33,6 +37,9 @@ BASE_CHROME_ARGS = [
     "--metrics-recording-only",
     "--ignore-gpu-blocklist",
 ]
+
+# 构建期预置二进制的默认路径(可用 CLOAKBROWSER_BINARY_PATH 覆盖)
+_DEFAULT_BINARY = "/opt/cloakbrowser/chrome"
 
 
 class StealthBrowser:
@@ -70,10 +77,41 @@ class StealthBrowser:
 
     # ------------------------------------------------------------------
     def binary_path(self) -> str:
-        """确保(或复用缓存的)免费版 stealth Chromium, 返回可执行文件路径。
-        keyless: 不带密钥, 走免费版 v146, 无需任何密钥。
+        """返回预置的 stealth Chromium 可执行文件路径(构建期已下载)。"""
+        path = os.environ.get("CLOAKBROWSER_BINARY_PATH") or _DEFAULT_BINARY
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"stealth Chromium 未找到: {path}。请确认镜像构建时已从 "
+                "GitHub Release 下载并预置该二进制(见 Dockerfile)。"
+            )
+        return path
+
+    # ------------------------------------------------------------------
+    def _stealth_args(self) -> list[str]:
+        """生成 CloakBrowser stealth 启动参数(等价上游 build_args 的
+        stealth_args=True 输出, 原生实现, 不依赖 wrapper)。
+
+        上游默认 stealth 集(源码核实, Linux/Windows 平台一律伪装 Windows):
+            --no-sandbox
+            --fingerprint=<seed>
+            --fingerprint-platform=windows
+        条件参数: timezone/locale/proxy/start_maximized(与 build_args 一致)。
         """
-        return ensure_binary()
+        args = [
+            "--no-sandbox",
+            f"--fingerprint={self.seed}",
+            "--fingerprint-platform=windows",
+        ]
+        if self.timezone:
+            args.append(f"--fingerprint-timezone={self.timezone}")
+        if self.locale:
+            args.append(f"--fingerprint-locale={self.locale}")
+            args.append(f"--lang={self.locale}")
+        if not self.headless:
+            args.append("--start-maximized")
+        if self.proxy:
+            args.append(f"--proxy-server={self.proxy}")
+        return args
 
     # ------------------------------------------------------------------
     def start(self) -> subprocess.Popen:
@@ -84,28 +122,12 @@ class StealthBrowser:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         binary = self.binary_path()
 
-        # --fingerprint=<seed>: CloakBrowser 的 stealth 指纹机制
-        fp_extra = [f"--fingerprint={self.seed}"]
-        if self.proxy:
-            fp_extra.append(f"--proxy-server={self.proxy}")
-        if not self.headless:
-            fp_extra.append("--start-maximized")
-
-        chrome_args = build_args(
-            stealth_args=True,
-            extra_args=fp_extra,
-            timezone=self.timezone,
-            locale=self.locale,
-            headless=self.headless,
-        )
-
         base = list(BASE_CHROME_ARGS)
         # 裸进程方式需显式启用 headless(上游 build_args 不注入 --headless)
         if self.headless:
             base.append("--headless=new")
-        # 容器普遍无 userns/SUID sandbox 权限; 确保 --no-sandbox 存在(去重)
-        if not any(a.split("=", 1)[0] == "--no-sandbox" for a in chrome_args):
-            base.append("--no-sandbox")
+
+        chrome_args = self._stealth_args()
 
         # "浏览器开启远程调用启动": 绑定 127.0.0.1, 仅内网可达
         cdp_flags = [
