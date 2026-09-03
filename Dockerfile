@@ -93,9 +93,10 @@ RUN set -eux; \
     done; \
     [ "${ok}" = "1" ] || { echo "所有下载源均失败, 请换 CLOAK_DOWNLOAD_URL/MIRRORS" >&2; exit 1; }; \
     echo "${CLOAK_BINARY_SHA256}  /tmp/cb.tar.gz" | sha256sum -c -; \
-    rm -f /tmp/cb.tar.gz; \
     mkdir -p /tmp/cb_extract /opt/cloakbrowser; \
+    # 必须先解压再删除, 否则 tar 找不到文件(exit 2)
     tar -xzf /tmp/cb.tar.gz -C /tmp/cb_extract; \
+    rm -f /tmp/cb.tar.gz; \
     chrome="$(find /tmp/cb_extract -maxdepth 6 -type f -name chrome -perm -u+x | head -n 1)"; \
     test -n "${chrome}" || { echo "chrome binary not found in archive" >&2; exit 1; }; \
     chromedir="$(dirname "${chrome}")"; \
