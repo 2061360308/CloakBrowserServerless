@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -189,3 +190,148 @@ class StealthBrowser:
             self.process = None
         if self._tmp_profile and self.profile_dir.exists():
             shutil.rmtree(self.profile_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 按客户端 sessionID(内含浏览器配置)懒启动/复用/切换的管理器
+# ---------------------------------------------------------------------------
+class BrowserBusy(Exception):
+    """当前浏览器正被其他会话占用, 无法按新配置切换。"""
+
+
+def normalize_cfg(raw: dict) -> dict:
+    """把客户端传入的 JSON 配置规范化为等价稳定 dict(用于幂等/复用比较)。
+
+    只保留真正影响浏览器进程的参数; None/空串归一为 None; extra_args 排序。
+    """
+
+    def _opt(name: str):
+        v = raw.get(name)
+        return v if v else None
+
+    extra = raw.get("extra_args") or raw.get("extra") or []
+    if isinstance(extra, str):
+        extra = extra.split()
+    return {
+        "seed": str(_opt("seed")) if _opt("seed") else None,
+        "timezone": _opt("timezone"),
+        "locale": _opt("locale"),
+        "proxy": _opt("proxy"),
+        "extra_args": sorted(str(a) for a in extra),
+    }
+
+
+class BrowserManager:
+    """单个实例内的浏览器门(gate): 按 cfg 懒启动/复用/切换 stealth Chromium。
+
+    设计前提: 同一时刻一个活跃会话(FC 单实例并发=1 天然保证), 同实例内
+    最多一个浏览器进程(内存约束)。语义:
+
+      - 相同 cfg 再次请求   -> 复用当前进程;
+      - 无进程              -> 按 cfg 启动并等待 CDP 就绪;
+      - 不同 cfg 且空闲     -> 停旧启新;
+      - 不同 cfg 但有活跃 WS -> 抛 BrowserBusy(409), 不踢人;
+      - 进程崩溃            -> supervisor watchdog 按当前 cfg 自动重启。
+
+    浏览器由客户端 GET /start 的 sessionID header 决定, 容器启动时不再
+    预启动; 断连后进程保留复用, 由 FC 空闲回收实例兜底清理。
+    """
+
+    def __init__(
+        self,
+        cdp_port: int = 9222,
+        headless: bool = True,
+        ready_timeout: float = 50.0,
+    ) -> None:
+        self.cdp_port = cdp_port
+        self.headless = headless
+        self.ready_timeout = ready_timeout
+        self._lock = asyncio.Lock()
+        self._browser: StealthBrowser | None = None
+        self._cfg: dict | None = None
+
+    @property
+    def browser(self) -> StealthBrowser | None:
+        return self._browser
+
+    def chrome_exists(self) -> bool:
+        """是否已创建浏览器进程(含启动中/已就绪)。代理据此快速失败/等待。"""
+        return self._browser is not None
+
+    def _running(self) -> bool:
+        b = self._browser
+        return b is not None and b.process is not None and b.process.poll() is None
+
+    # ------------------------------------------------------------------
+    def _new_browser(self, cfg: dict) -> StealthBrowser:
+        """按归一化配置构造浏览器对象(不启动)。"""
+        return StealthBrowser(
+            cdp_port=self.cdp_port,
+            headless=self.headless,
+            seed=cfg["seed"],
+            profile_dir=os.environ.get("PROFILE_DIR") or None,
+            timezone=cfg["timezone"],
+            locale=cfg["locale"],
+            proxy=cfg["proxy"],
+            extra_args=cfg["extra_args"],
+        )
+
+    def _describe(self) -> dict:
+        return {"status": "ready", "seed": self._cfg.get("seed") if self._cfg else None}
+
+    # ------------------------------------------------------------------
+    async def ensure(self, cfg_raw: dict, active_ws: int = 0) -> dict:
+        """确保存在与 cfg 匹配且 CDP 就绪的浏览器; 返回状态 dict。"""
+        cfg = normalize_cfg(cfg_raw)
+        async with self._lock:
+            if self._running() and self._cfg == cfg:
+                logger.info("浏览器配置一致, 直接复用: %s", cfg)
+            elif self._running():
+                if active_ws > 0:
+                    raise BrowserBusy("浏览器正被其他会话使用且配置不同, 无法切换")
+                logger.info("切换浏览器配置: %s -> %s", self._cfg, cfg)
+                await self._stop_locked()
+                self._start_locked(cfg)
+            else:
+                self._start_locked(cfg)
+            await self._wait_ready_locked()
+            return self._describe()
+
+    def _start_locked(self, cfg: dict) -> None:
+        self._cfg = cfg
+        self._browser = self._new_browser(cfg)
+        self._browser.start()
+
+    async def _stop_locked(self) -> None:
+        if self._browser is not None:
+            await asyncio.to_thread(self._browser.stop)
+        self._browser = None
+        self._cfg = None
+
+    async def _wait_ready_locked(self) -> None:
+        assert self._browser is not None
+        await asyncio.to_thread(self._browser.wait_ready, self.ready_timeout)
+
+    # ------------------------------------------------------------------
+    async def restart_current(self) -> None:
+        """watchdog 用: 当前浏览器进程崩溃后按原 cfg 重启(幂等)。
+
+        重启失败(如持续起不来)则清空引用, 由下一次 ensure 重新创建,
+        避免 watchdog 按过期配置空转。
+        """
+        async with self._lock:
+            if self._browser is None:
+                return
+            cfg = self._cfg
+            try:
+                await asyncio.to_thread(self._browser.start)
+                await asyncio.to_thread(self._browser.wait_ready, self.ready_timeout)
+                logger.info("浏览器已按配置重启并就绪: %s", cfg)
+            except Exception:  # noqa: BLE001
+                logger.exception("浏览器重启失败, 标记为不可用(下次请求时重建)")
+                self._browser = None
+                self._cfg = None
+
+    async def stop(self) -> None:
+        async with self._lock:
+            await self._stop_locked()

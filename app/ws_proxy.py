@@ -4,6 +4,9 @@
 监听 0.0.0.0:<PROXY_PORT>(默认 9000), 后端为 127.0.0.1:<CDP_PORT> 上以
 remote debugging 启动的 stealth Chromium。支持:
 
+  - GET /start          -> 懒启动入口: 读取 sessionID header(内含 base64url
+                           JSON 浏览器配置), 启动/复用/切换对应浏览器后返回
+                           {"status":"ready","ws": 稳定根地址}; 供后续直连
   - GET /json/version  -> 转发浏览器版本信息; webSocketDebuggerUrl 返回
                           无实例状态的稳定入口 ws(s)://<host>/(根路径,
                           由代理动态解析当前浏览器), 跨实例/重启均有效
@@ -13,6 +16,12 @@ remote debugging 启动的 stealth Chromium。支持:
                           (方便裸 ws 客户端直接连 ws://host:9000)
   - GET /              -> 健康检查(恒 200, 供 FC 探活)
 
+浏览器生命周期: 不再于容器启动时预启动, 而是由首个 GET /start 按客户端
+sessionID 懒启动; WS 断开后进程保留复用, 由 FC 空闲回收实例兜底清理。
+serve() 可传入一个 BrowserManager(gate) 提供 /start 能力与"浏览器是否已
+创建"判定; gate 为 None 时行为与旧版一致(假定后端浏览器已由外部启动)。
+
+
 用法:
     python -m app.ws_proxy                # 后端默认 127.0.0.1:9222
     CDP_PORT=9222 PROXY_PORT=9000 python -m app.ws_proxy
@@ -20,6 +29,7 @@ remote debugging 启动的 stealth Chromium。支持:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -34,6 +44,8 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed, WebSocketException
 from websockets.http11 import Response
 from websockets.protocol import State
+
+from app.browser import BrowserBusy
 
 # 说明: 跟随 websockets 最新版(17.x)默认的 asyncio 实现:
 # serve() 的 process_request 回调签名是 (connection, request); 返回
@@ -207,6 +219,26 @@ def _stable_browser_ws(headers: Headers) -> str:
     return f"{_ws_scheme(headers)}://{_external_host(headers)}/"
 
 
+def _header_value(headers: Headers, name: str) -> str | None:
+    """大小写不敏感地读取 header(FC 网关可能改写 header 名大小写)。"""
+    low = name.lower()
+    for key, value in headers.items():
+        if key.lower() == low:
+            return value
+    return None
+
+
+def _decode_session(sid: str) -> dict | None:
+    """把 sessionID(base64url 编码的 JSON 对象)解码为配置 dict; 失败返回 None。"""
+    try:
+        b = sid.encode("ascii")
+        raw = base64.urlsafe_b64decode(b + b"=" * (-len(b) % 4))
+        cfg = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - 任何解码失败一律视为非法 sessionID
+        return None
+    return cfg if isinstance(cfg, dict) else None
+
+
 async def _version_payload(cdp_port: int, headers: Headers) -> dict:
     data = await _fetch_json(cdp_port, "/json/version")
     if data.get("webSocketDebuggerUrl"):
@@ -224,7 +256,8 @@ async def _list_payload(cdp_port: int, headers: Headers) -> list:
     return data
 
 
-async def _health_payload(cdp_port: int, headers: Headers) -> dict:
+async def _health_payload(cdp_port: int, headers: Headers,
+                          gate: Any | None = None) -> dict:
     # 健康检查语义(适配阿里云 FC): GET / 只要服务存活即返回 200,
     # 浏览器就绪状态放入 body; FC 探活依赖 200 判定实例存活。
     body: dict[str, Any] = {
@@ -233,6 +266,11 @@ async def _health_payload(cdp_port: int, headers: Headers) -> dict:
         "listen": f"0.0.0.0:{env_int('PROXY_PORT', 9000)}",
         "backend_cdp": f"127.0.0.1:{cdp_port}",
     }
+    # 懒启动模式: 浏览器尚未创建时如实标注并给提示(仍返回 200, FC 探活不受影响)
+    if gate is not None and not gate.chrome_exists():
+        body["browser_status"] = "not_created"
+        body["hint"] = "GET /start 并携带 sessionID header 以按需启动浏览器"
+        return body
     try:
         version = await _fetch_json(cdp_port, "/json/version")
         body["browser"] = version.get("Browser", "")
@@ -245,12 +283,62 @@ async def _health_payload(cdp_port: int, headers: Headers) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GET /start: 懒启动入口(读取 sessionID header, 启动/复用/切换浏览器)
+# ---------------------------------------------------------------------------
+async def _handle_start(
+    cdp_port: int,
+    connection: ServerConnection,
+    request: Any,
+    gate: Any,
+    active_ws: int,
+) -> Response:
+    """按 sessionID header(base64url JSON 浏览器配置)确保浏览器就绪。
+
+    成功返回 200 {"status":"ready","ws":<稳定根地址>,"seed":...,"browser":...};
+    失败: 400(缺/坏 header) / 409(浏览器正被占用且配置不同) /
+          503(启动超时或失败)。
+    """
+    sid = _header_value(request.headers, "sessionid")
+    if not sid:
+        return _json_response(connection, 400, {
+            "error": "missing sessionID header",
+            "hint": "sessionID = base64url(JSON of browser config), "
+                    "e.g. {seed,timezone,locale,proxy,extra_args}",
+        })
+    cfg = _decode_session(sid)
+    if cfg is None:
+        return _json_response(connection, 400, {
+            "error": "sessionID 解码失败",
+            "hint": "sessionID 必须是 base64url 编码的 JSON 对象",
+        })
+    try:
+        status = await gate.ensure(cfg, active_ws)
+    except BrowserBusy as exc:
+        return _json_response(connection, 409, {"error": str(exc)})
+    except Exception as exc:  # noqa: BLE001
+        logger.error("浏览器按 sessionID 启动失败: %s", exc)
+        return _json_response(connection, 503, {
+            "error": "browser startup failed", "detail": str(exc),
+        })
+    body: dict[str, Any] = dict(status)
+    body["ws"] = _stable_browser_ws(request.headers)
+    try:
+        version = await _fetch_json(cdp_port, "/json/version")
+        body["browser"] = version.get("Browser", "")
+    except Exception:  # noqa: BLE001
+        body["browser"] = ""
+    logger.info("/start 完成: 配置=%s, active_ws=%s", body.get("seed"), active_ws)
+    return _json_response(connection, 200, body)
+
+
+# ---------------------------------------------------------------------------
 # 非 WS HTTP 请求处理(新版 process_request 回调):
 # 签名 (connection, request); 返回 None 继续 WS 握手,
 # 返回 Response 对象则按 HTTP 响应返回。
 # ---------------------------------------------------------------------------
 async def _process_request(
     cdp_port: int, connection: ServerConnection, request: Any,
+    gate: Any | None = None, active_ref: list[int] | None = None,
 ) -> Optional[Response]:
     headers: Headers = request.headers
     path = request.path
@@ -258,10 +346,28 @@ async def _process_request(
 
     # GET / 健康检查: 恒 200(不等待浏览器, FC 探活/崩溃重启期间均存活)
     if path == "/" and not is_upgrade:
-        payload = await _health_payload(cdp_port, headers)
+        payload = await _health_payload(cdp_port, headers, gate)
         return _json_response(connection, 200, payload)
 
-    # 其余请求(业务端点/WS 升级)在浏览器就绪前自动等待
+    # GET /start: 懒启动入口(浏览器创建/复用/切换由 gate 完成, 内部自等就绪)
+    if path in ("/start", "/start/"):
+        if gate is None:
+            return _json_response(connection, 501, {
+                "error": "browser gate not configured",
+                "hint": "由 supervisor 编排运行(本独立进程未接管浏览器)",
+            })
+        return await _handle_start(
+            cdp_port, connection, request, gate,
+            active_ref[0] if active_ref else 0,
+        )
+
+    # 业务端点/WS 升级: 懒启动模式下浏览器未创建则快速失败(避免空等超时);
+    # 已创建则等待其就绪(启动中/崩溃重启期间连接自动等待, 客户端无感)
+    if gate is not None and not gate.chrome_exists():
+        return _json_response(connection, 503, {
+            "error": "browser not created",
+            "hint": "call GET /start with a sessionID header first",
+        })
     if not await _wait_browser_ready(cdp_port):
         return _json_response(connection, 503, {
             "error": "browser not ready after timeout",
@@ -376,19 +482,35 @@ async def route_ws(cdp_port: int, client_ws: ServerConnection) -> None:
 # ---------------------------------------------------------------------------
 # 服务装配: websockets.serve(唯一监听入口, HTTP + WS 同端口)
 # ---------------------------------------------------------------------------
-async def serve(cdp_port: int, proxy_port: int, stop: asyncio.Event) -> None:
-    """启动 0.0.0.0:<proxy_port> 服务, 直到 stop 事件被置位后优雅关闭。"""
+async def serve(cdp_port: int, proxy_port: int, stop: asyncio.Event,
+                gate: Any | None = None) -> None:
+    """启动 0.0.0.0:<proxy_port> 服务, 直到 stop 事件被置位后优雅关闭。
+
+    gate: 可选 BrowserManager。提供后启用 GET /start 懒启动入口,
+    并对"浏览器未创建"的业务请求快速失败(不再空等)。
+    """
+    # 活跃 WS 会话计数(同事件循环内单线程增减; 供 /start 判断能否切换浏览器)
+    active_ws: list[int] = [0]
+
+    async def _ws_handler(client_ws: ServerConnection) -> None:
+        active_ws[0] += 1
+        try:
+            await route_ws(cdp_port, client_ws)
+        finally:
+            active_ws[0] -= 1
+
     server = await websockets.serve(
-        lambda ws: route_ws(cdp_port, ws),
+        _ws_handler,
         "0.0.0.0", proxy_port,
         process_request=lambda connection, request: _process_request(
-            cdp_port, connection, request),
+            cdp_port, connection, request, gate=gate, active_ref=active_ws),
         max_size=_MAX_MSG_SIZE,
         ping_interval=None,
         ping_timeout=None,
     )
     logger.info(
-        "WS 代理已监听 0.0.0.0:%d -> 127.0.0.1:%d (CDP)", proxy_port, cdp_port,
+        "WS 代理已监听 0.0.0.0:%d -> 127.0.0.1:%d (CDP); gate=%s",
+        proxy_port, cdp_port, "on" if gate is not None else "off",
     )
     await stop.wait()
     server.close()
