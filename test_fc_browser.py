@@ -7,8 +7,9 @@
      -> GET /start 等浏览器就绪, 返回 BrowserSession(含最终 session_id/ws);
   3. sess.connect() = Playwright connect_over_cdp(ws, headers={"sessionID": ...})
      直连浏览器;
-  4. 结束后 sess.close(destroy_instance=False): 仅断开 WS, 实例保留复用,
-     等 FC 自动回收(与 fc_browser.py destroy() 区分: destroy=True 走 SDK 停实例)。
+  4. 测试结束后 sess.destroy(): 通过 FC SDK DeleteSession 停掉本会话实例,
+     不留浏览器进程(单测场景用完即销毁; 需要复用保留的自动化场景请改用
+     close(destroy_instance=False))。
 
 用法:
     python test_fc_browser.py <FC_BASE_URL> ['{"seed":"123","timezone":"..."}'] [function_name]
@@ -112,10 +113,10 @@ async def main() -> None:
         await page.screenshot(path=shot, full_page=False)
         print(f"[OK] 截图已保存: {shot}")
 
-        # 仅断开 WS: 远端浏览器进程保留复用, 等待 FC 回收(不销毁实例)
-        print("[DONE] 测试通过, 断开连接(实例保留, destroy_instance=False)")
+        # 单测场景: 断开 WS 后销毁远端实例, 不留浏览器进程
         await browser.close()
-        sess.destroy() # 销毁实例
+        sess.destroy()
+        print("[DONE] 测试通过, 会话实例已销毁")
 
 if __name__ == "__main__":
     try:
