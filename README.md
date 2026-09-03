@@ -1,213 +1,258 @@
-# cloakbrowser keyless Docker (WS 代理转发版)
+# cloakbrowser keyless Docker（WS 代理 + 会话亲和懒启动）
 
 基于开源 [CloakHQ/CloakBrowser](https://github.com/CloakHQ/CloakBrowser)
-自建的 Docker 镜像：容器内以 **remote debugging(远程调用)** 模式启动
-stealth Chromium，再由一个 **Python WS 代理** 把真实的浏览器控制面转发到
-`0.0.0.0:9000`，供外部 CDP 客户端接入。**默认 headless(无头)模式**，
-无需 Xvfb/显示环境，可直接部署到阿里云函数计算等无头平台。
+自建的 Docker 镜像：容器内置 **stealth Chromium（远程调试模式）**，再由一个
+**Python WS 代理**把浏览器控制面转发到 `0.0.0.0:9000`。部署到阿里云函数计算
+（FC）后，浏览器**按需懒启动**：外部客户端先 `GET /start`（携带会话与配置），
+拿到稳定 `wss://` 根地址，再用 Playwright / Puppeteer / 裸 WebSocket 直连。
 
-## 许可证与体积(极简)说明
+> 与普通"浏览器常驻服务"不同，本服务**不预启动浏览器**、也不靠环境变量注入
+> 指纹：每个浏览器实例的参数（seed/时区/语言/代理等）由客户端**按请求下发**，
+> 结合 FC 的 **HeaderField 会话亲和**保证同一会话的所有请求落在同一实例，
+> 多用户互不干扰、各自独立实例，用完可随时销毁。
 
-- **二进制来源**：CloakBrowser 免费版 **stealth Chromium v146**（keyless，
-  无需密钥、无需登录）发布在其官方
-  [GitHub Releases](https://github.com/CloakHQ/CloakBrowser/releases/tag/chromium-v146.0.7680.177.5)
-  上（asset: `cloakbrowser-linux-x64.tar.gz`）。本镜像在**构建期**直接下载
-  该二进制并做 sha256 校验，预置进镜像层（运行时不再联网）。
-- **零 wrapper / 零驱动**：不使用 CloakBrowser 的 Python wrapper（其源码
-  MIT 开源，但其元数据强制绑定 playwright 等一堆依赖）。stealth 启动参数
-  经源码核实就是默认三件套 `--no-sandbox --fingerprint=<seed>
-  --fingerprint-platform=windows`（外加可选的时区/语言/代理），由
-  `app/browser.py` **原生生成**。
-- **镜像内第三方 Python 依赖只有 `websockets` 一个**（HTTP 探活/列表转发
-  用 Python 标准库 `urllib` 实现），**没有 playwright、没有 aiohttp、
-  没有 wrapper**。
-- 若需要 Pro/新版浏览器，可自行替换 GitHub Release 版本并更新
-  `CLOAK_BINARY_SHA256` 构建 ARG；本仓库默认按免费 keyless 构建。
+## 特性
 
-## 架构
+- **keyless stealth Chromium v146**：免费版（无需密钥/登录），二进制构建期从
+  CloakHQ 官方 [GitHub Releases](https://github.com/CloakHQ/CloakBrowser/releases/tag/chromium-v146.0.7680.177.5)
+  下载并做 **sha256 校验**，预置进镜像层（运行时不再联网、不依赖外网下载）。
+- **零 wrapper / 零驱动**：不用 CloakBrowser 的 Python wrapper（避免其强绑
+  playwright 等依赖）；stealth 启动参数（`--no-sandbox --fingerprint=<seed>
+  --fingerprint-platform=windows` + 可选时区/语言/代理）由 `app/browser.py`
+  原生生成。
+- **镜像第三方 Python 依赖仅 `websockets` 一个**（HTTP 探活/转发用标准库实现）。
+- **默认 headless**，无需 Xvfb/显示环境，天然适配 FC 等无头平台。
+- **懒启动 + 会话亲和**：容器启动即监听 9000（健康检查秒过），浏览器等首个
+  `GET /start` 按客户端配置创建；FC HeaderField 亲和（键名 `sessionid`）把
+  同一会话的后续请求（含 Playwright WS）稳定路由到同一实例。
+- **按请求下发指纹**：`seed` / `timezone` / `locale` / `proxy` /
+  `extra_args` 全部来自 `X-Browser-Cfg` 头，同一个容器服务多个"身份互不相同"
+  的会话，互不冲突；会话级 `seq` 自增可随时**激发全新实例**（新身份）。
+- **健壮**：WS 断开后浏览器保留复用（同会话重连直接命中）；进程崩溃自动按原
+  配置重启；容器优雅停机（`SIGTERM`）清理浏览器。
+
+## 工作原理
+
+### 生命周期（懒启动）
 
 ```
-   +------------------------------ 容器启动时序(顺序式) ------------------------------+
-   | 阶段 1: 启动 stealth Chromium(remote debugging 127.0.0.1:9222)   ← 未就绪不算启动成功 |
-   |          阻塞等待 CDP 就绪(默认上限 50s)                                          |
-   | 阶段 2: 浏览器就绪后, WS 代理才监听 0.0.0.0:9000          ← 此刻函数"启动成功"      |
-   | 阶段 3: 守护: 浏览器崩溃自动重启; SIGTERM/SIGINT 优雅退出                          |
-   +---------------------------------------------------------------------------------+
-                              ▲
-       外部客户端(浏览器就绪后才可达)
-   Playwright / puppeteer / 任意 ws 客户端 ──► ws://host:9000 ──双向转发──► 127.0.0.1:9222
+  +-------------------------- 容器启动(FC 实例) ---------------------------+
+  | WS 代理先行监听 0.0.0.0:9000  ← 立即就绪, GET / 恒 200, FC 判定启动成功 |
+  |                                浏览器此刻尚不存在(browser_status: 未创建)|
+  +------------------------------------------------------------------------+
+                                   ▲
+  外部客户端两步接入:
+    1) GET /start   (携带 sessionID + X-Browser-Cfg)   ← 浏览器在此刻才启动
+       返回 {"status":"ready","ws":"wss://<host>/"}
+    2) Playwright/Puppeteer connect_over_cdp(ws, headers={"sessionID": ...})
+       后续 /json/version 与 WS 握手都只带 sessionID —— FC 亲和路由 + 服务端
+       会话比对保证命中同实例的同一浏览器。
 ```
 
-- **阶段 1**：`app/browser.py` 以远程调试模式启动浏览器（带 stealth 指纹、
-  反检测参数、`--headless=new`），并轮询 `/json/version` 直到就绪。
-  浏览器未就绪时**不监听 9000**，超时(默认 50s)直接以非 0 码退出——
-  容器启动失败，FC 会判定实例启动失败。
-- **阶段 2**：浏览器就绪后 `app/ws_proxy.py` 才开始监听 `0.0.0.0:9000`，
-  此刻平台健康探测才能返回 200。代理提供 `GET /json/version`、
-  `GET /json/list` 与 WebSocket 双向转发（`/devtools/...` 与根路径
-  browser-level 连接均可）。
-- **阶段 3**：浏览器运行中崩溃自动重启；容器收到 `SIGTERM`/`SIGINT` 优雅退出。
+### 两个自定义 Header（协议约定）
 
-### 浏览器重启期间的连接语义
+FC 平台对会话亲和的键（`sessionid`）值有**硬限制：1–64 字符、字符集
+`^[A-Za-z0-9_][A-Za-z0-9_-]*$`**（实测整份 base64 配置会以 `400 InvalidArgument`
+被网关拒绝），因此拆成两个头：
 
-服务成功启动后，如果浏览器在运行中崩溃并自动重启：
+| Header | 内容 | 何时携带 |
+| --- | --- | --- |
+| `sessionID` | `sha256(JSON(cfg+seq), sort_keys).hexdigest()` 的 64 位 hex，即 FC 亲和会话 ID（也作 `ListSessions` / `DeleteSession` 对象） | 每个请求（`/start`、`/json/*`、WS 握手） |
+| `X-Browser-Cfg` | `base64url(JSON 浏览器配置)`，键：`seed`/`timezone`/`locale`/`proxy`/`extra_args` | 仅 `GET /start`（缺失=服务端默认随机配置） |
 
-- `GET /`（健康检查/探活）：仍即时返回 200（实例存活，FC 不会误杀），
-  body 内 `browser_status=starting/ready`。
-- `GET /json/version`、`GET /json/list`、`/devtools/...` WS、根路径 WS 等
-  **业务端点**：浏览器未就绪时**自动阻塞等待**（默认最长 180 秒，
-  可用 `WAIT_BROWSER_TIMEOUT` 调整），就绪后立即返回真实数据——
-  **Playwright `connect_over_cdp` 在此场景下无需自写重试**。仅当超过等待
-  上限仍未就绪才返回 502。
-- **已建立的 CDP 连接会断开**（playwright 报 `Target closed`/连接错误），
-  需客户端捕获后重连，重连请求自动走上述等待逻辑。
+同 `cfg+seq` → 同 sessionID → 亲和命中同一实例（**复用**）；`seq` 自增 →
+新 sessionID → 亲和激发**全新实例**（新身份，互不串扰）。
 
-## 构建与运行
+### HTTP/WS 端点一览
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /` | 健康检查恒 200（FC 探活）；body 含 `browser_status: not_created/starting/ready` |
+| `GET /start` | 懒启动入口（需 `sessionID`，配置走 `X-Browser-Cfg`）→ `{"status":"ready","ws":稳定根地址,"browser":...}`；400=缺/坏头，409=本实例正被其他会话占用 |
+| `GET /json/version` | CDP 版本信息；`webSocketDebuggerUrl` 返回**稳定根地址**（不带随机 uuid，跨实例/重启可用） |
+| `GET /json/list` | CDP 目标列表（host 已重写） |
+| WS `/(根路径)` | browser-level CDP 双向转发（裸 ws 客户端直连用） |
+| WS `/devtools/<type>/<id>` | 页面/目标级 CDP 转发 |
+
+## 构建与本地运行
 
 ```bash
-# 构建镜像(默认 headless; 固定 chromium-v146.0.7680.177.5 + sha256 校验)
+# 构建镜像(默认 headless; 固定 chromium-v146 + sha256 校验, 构建期预下载)
 docker build -t cloakbrowser-ws-proxy:local .
 
-# 基础镜像/pip/apt 默认均已走国内源(DaoCloud Docker Hub 代理 + 阿里云 pip/apt),
-# 不依赖 docker.io, 可直接在 CNB / 阿里云 ACR 等国内构建节点构建; 仍可按需覆盖:
-#   --build-arg PYTHON_IMAGE=python:3.12-slim                        # 切回官方源
-#   --build-arg PYTHON_IMAGE=mirror.ccs.tencentyun.com/library/python:3.12-slim  # 腾讯云内网源
-#   --build-arg CLOAK_CHROMIUM_VERSION=146.0.7680.177.5              # 浏览器版本
-#   --build-arg CLOAK_BINARY_SHA256=<对应 asset 的 sha256>            # 下载校验(勿改错)
-#   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
-#   --build-arg APT_MIRROR=mirrors.tencentyun.com
-
-# Chromium 二进制约 207MB(tar.gz)。下载源默认逐个 fallback:
-#   自定义 URL -> 常用 GitHub 加速镜像(ghfast.top/gh-proxy.com/ghproxy.net)
-#   -> 官方直链; 已内置 sha256 校验。若默认镜像在构建节点不可达, 可覆盖:
-#   --build-arg CLOAK_DOWNLOAD_URL=<自建 OSS/内网完整下载 URL>
+# 常用可覆盖构建参数(国内构建节点友好, 默认已走 DaoCloud 基镜像/阿里云 pip/中科大 apt):
+#   --build-arg CLOAK_CHROMIUM_VERSION=146.0.7680.177.5   # 浏览器版本
+#   --build-arg CLOAK_BINARY_SHA256=<对应 asset sha256>   # 下载校验(勿改错)
+#   --build-arg CLOAK_DOWNLOAD_URL=<自建 OSS/内网完整 URL>  # Chromium 下载源(默认多个加速镜像 fallback)
 #   --build-arg CLOAK_DOWNLOAD_MIRRORS="https://ghfast.top/ https://gh-proxy.com/"
-#   --build-arg CLOAK_DOWNLOAD_TIMEOUT=600      # 单源总超时(秒)
+#   --build-arg ENABLE_HEADED=true        # 需要 headed(可视化): 多装 Xvfb/openbox
+#   --build-arg PIP_INDEX_URL=...  --build-arg APT_MIRROR=...
 
-# 需要 headed(可视化)模式: 多装 Xvfb/openbox
-docker build --build-arg ENABLE_HEADED=true -t cloakbrowser-ws-proxy:local .
-
-# 运行
+# 本地运行
 docker run -d --name cloakbrowser -p 9000:9000 cloakbrowser-ws-proxy:local
-
-# 或使用 compose
-docker compose up -d --build
-
-# 查看日志(浏览器启动过程/代理连接)
+# 或: docker compose up -d --build
 docker logs -f cloakbrowser
 ```
 
-## 客户端接入示例
+本地验证两步接入：
 
-### Playwright / Puppeteer(CDP over HTTP)
-
-```python
-from playwright.sync_api import sync_playwright
-
-with sync_playwright() as p:
-    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9000")
-    page = browser.new_page()
-    page.goto("https://example.com")
-    print(page.title())
-    browser.close()
+```bash
+# 1) 构造 sessionID(客户端统一取 64 位 sha256 hex; 任意稳定值亦可)
+SID=$(printf '%s' 'demo-session-001' | sha256sum | cut -c1-64)
+# 2) 懒启动(本地无 FC 亲和, 配置头同样生效)
+curl -i -H "sessionID: $SID" \
+     -H "X-Browser-Cfg: $(printf '%s' '{"seed":"12345","timezone":"Asia/Shanghai"}' | base64 -w0)" \
+     http://127.0.0.1:9000/start
+# 3) 直连(根地址)
+curl -H "sessionID: $SID" http://127.0.0.1:9000/json/version
 ```
 
-Puppeteer 等价写法：`puppeteer.connect({ browserWSEndpoint: "ws://host:9000/devtools/browser/<id>" })`
-或直接使用 `GET http://host:9000/json/version` 返回的 `webSocketDebuggerUrl`
-（代理已自动把地址重写为对外可达）。
+## 部署到阿里云函数计算（FC）
 
-### 裸 WebSocket(CDP 协议)
+### 1) 构建并推送到 ACR（容器镜像服务，个人版即可）
+
+```bash
+docker build -t cloakbrowser-ws-proxy:local .
+
+# ACR 个人版仓库地址: registry.<region>.aliyuncs.com/<命名空间>/<镜像名>
+docker tag cloakbrowser-ws-proxy:local \
+       registry.cn-hangzhou.aliyuncs.com/<namespace>/cloakbrowser:latest
+docker login --username=<阿里云账号全名> registry.cn-hangzhou.aliyuncs.com
+docker push registry.cn-hangzhou.aliyuncs.com/<namespace>/cloakbrowser:latest
+```
+
+> 个人版 ACR 也支持**控制台/制品源直接构建**；镜像较大（Chromium 约 200MB+），
+> 建议推送到与 FC 函数同地域的 ACR，减少冷启动拉取时间。
+> 若在 ACR/CI 里构建，记得覆盖 `CLOAK_DOWNLOAD_MIRRORS` 为可达的加速源。
+
+### 2) 创建 FC 函数（自定义容器 Custom Container）
+
+1. **镜像**：选上一步 ACR 地址；启动命令/参数留空（用镜像 ENTRYPOINT）。
+2. **端口**：`9000`；**健康检查路径**：`/`（懒启动下代理即刻就绪，探测秒过）。
+3. **请求处理超时**：调大（建议 ≥ 120s），覆盖 `/start` 的浏览器冷启动
+   （就绪上限默认 90s，可用 `BROWSER_READY_TIMEOUT` 调整）。
+4. **单实例并发数设为 1**：保证一个实例同一时刻只服务一个会话。
+5. **开启会话亲和（关键）**：在函数配置中开启会话亲和 → 选择
+   **HeaderField 亲和** → 自定义键名填 **`sessionid`**（值即上面的
+   `sessionID` 头，平台要求 1–64 字符、`^[A-Za-z0-9_][A-Za-z0-9_-]*$`，
+   客户端发送 64 位 sha256 hex 恰好满足）。
+6. 记录**公网入口**（函数 HTTP 触发域名，形如 `https://<xxx>.cn-<region>.fcapp.run`）
+   与 **FC OpenAPI endpoint**（`<account-id>.<region>.fc.aliyuncs.com`）。
+
+> 控制台不同版本字段名可能略有差异（如"会话亲和/亲和策略/自定义 Key"），
+> 本质是 HeaderField 亲和 + 键名 `sessionid`。未开启亲和的直接后果：
+> `/json/version` 与 WS 可能被路由到不同实例导致连接失败。
+
+### 3) 权限与网络
+
+- 调用/销毁会话（`ListSessions` / `DeleteSession`）需在 RAM 为子账号授予该
+  函数的相应权限，客户端用 AK/SK（环境变量
+  `ALIBABA_CLOUD_ACCESS_KEY_ID`/`ALIBABA_CLOUD_ACCESS_KEY_SECRET` 或
+  `~/.alibabacloud/credentials`）即可，无需写在代码里。
+- 需要固定出口 IP / 访问特定站点时，可配置 FC 的 NAT/固定公网 IP，或经配置
+  头 `proxy` 走上游代理。
+
+## 客户端调用（Playwright）
+
+### 推荐：使用 `fc_browser.py` 封装类
+
+仓库自带一个高层封装（`/workspace/fc_browser.py`），内部完成
+「构建 sessionID → `ListSessions` 检查存活 → 无则 `GET /start` → 返回就绪会话
+→ `DeleteSession` 销毁」全流程，Playwright 侧只需：
 
 ```python
-import asyncio, json, websockets
+from fc_browser import FcBrowser
+from playwright.async_api import async_playwright
+
+mgr = FcBrowser(
+    public_base="https://<fc公网域名>.fcapp.run",       # 或环境变量 FC_PUBLIC_BASE
+    api_endpoint="<account-id>.<region>.fc.aliyuncs.com",  # 或 FC_API_ENDPOINT
+    function_name="<你的函数名>",                          # 或 FC_FUNCTION_NAME
+)
+
+# create(): 同参数+seq 已有存活实例时会自动 seq 自增 -> 激发全新实例;
+# 返回 BrowserSession(已 /start 就绪)。
+sess = mgr.create({
+    "seed": "12345",                 # 随机指纹种子: 同 seed 同身份
+    "timezone": "Asia/Shanghai",     # 浏览器时区
+    "locale": "zh-CN",               # 浏览器语言
+    # "proxy": "http://user:pass@host:3128",   # 可选出站代理(密码明文)
+    # "extra_args": [...],           # 附加浏览器启动参数
+})
 
 async def main():
-    # 根路径自动转发到 browser-level CDP
-    async with websockets.connect("ws://127.0.0.1:9000") as ws:
-        await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
-        print(await ws.recv())
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(
+            sess.ws_url, headers=sess.connect_headers(), timeout=60_000)
+        page = await browser.new_page()
+        await page.goto("https://example.com")
+        print(await page.title())
+        await browser.close()
+    sess.destroy()   # FC SDK DeleteSession 停掉实例(按量计费, 用完即销毁)
 
-asyncio.run(main())
+# asyncio.run(main())
+```
+
+依赖：`playwright` + 阿里云 FC SDK 四件套
+（`pip install alibabacloud_fc20230330 alibabacloud_credentials
+alibabacloud_tea_openapi alibabacloud_tea_util`）。
+
+### 完整可运行示例
+
+**[`test_fc_browser.py`](test_fc_browser.py)** 是一份可运行的端到端参考脚本
+（建会话 → 打开抖音聊天页 → 截图 → 销毁），用法：
+
+```bash
+export ALIBABA_CLOUD_ACCESS_KEY_ID=... ALIBABA_CLOUD_ACCESS_KEY_SECRET=...
+export FC_API_ENDPOINT=<account-id>.<region>.fc.aliyuncs.com
+export FC_FUNCTION_NAME=<函数名>
+
+python test_fc_browser.py 'https://<fc公网域名>.fcapp.run' \
+    '{"seed":"test-1209","timezone":"Asia/Shanghai","locale":"zh-CN"}'
+```
+
+### 手动两步（不依赖 SDK）
+
+```bash
+SID=$(printf '%s' '{"seed":"12345","timezone":"Asia/Shanghai","seq":0}' \
+      | python3 -c 'import sys,hashlib;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
+CFG=$(python3 -c 'import base64,json;print(base64.urlsafe_b64encode(json.dumps(
+      {"seed":"12345","timezone":"Asia/Shanghai"}).encode()).decode())')
+
+# 1) 懒启动, 拿到稳定根地址(含 ws 字段)
+curl -H "sessionID: $SID" -H "X-Browser-Cfg: $CFG" \
+     https://<fc公网域名>.fcapp.run/start
+# 2) Playwright 直连: connect_over_cdp("wss://<fc公网域名>.fcapp.run/",
+#        headers={"sessionID": "<上面的SID>"})
 ```
 
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PROXY_PORT` | `9000` | 对外监听端口(FC 要求 9000, 勿改) |
-| `CDP_PORT` | `9222` | 浏览器内部 remote debugging 端口(仅 127.0.0.1) |
-| `BROWSER_HEADLESS` | `true` | `true` 无头(推荐, 无需 Xvfb)；`false` 需 `ENABLE_HEADED=true` 构建 |
-| `BROWSER_READY_TIMEOUT` | `50` | 启动期浏览器就绪上限(秒)；需 < FC 60s 探测窗口 |
-| `FINGERPRINT_SEED` | 空 | 固定 stealth 指纹；留空则每次启动随机新身份(适合防关联) |
-| `PROFILE_DIR` | `/data/profile` | 固定 seed 时的持久化 profile |
-| `CLOAK_TIMEZONE` | 空 | 浏览器时区, 如 `Asia/Shanghai`(可空, 自动) |
-| `CLOAK_LOCALE` | 空 | 浏览器语言, 如 `zh-CN` |
-| `PROXY` | 空 | 出站代理, 如 `http://user:pass@host:port`、`socks5://host:port` |
-| `EXTRA_BROWSER_ARGS` | 空 | 附加浏览器命令行参数, 空格分隔 |
-| `WAIT_BROWSER_TIMEOUT` | `180` | 业务端点自动等待浏览器就绪的最长时间(秒) |
+| `PROXY_PORT` | `9000` | 对外监听端口（FC 要求 9000，勿改） |
+| `CDP_PORT` | `9222` | 浏览器内部 remote debugging 端口（仅 127.0.0.1） |
+| `BROWSER_HEADLESS` | `true` | `true` 无头（推荐，FC 友好）；`false` 需 `ENABLE_HEADED=true` 构建 |
+| `BROWSER_READY_TIMEOUT` | `90` | `/start` 冷启动浏览器就绪上限（秒），需 < FC 请求超时 |
+| `WAIT_BROWSER_TIMEOUT` | `180` | 浏览器崩溃重启期间业务端点自动等待的最长时间（秒） |
+| `PROFILE_DIR` | `/data/profile` | 固定 seed 会话的 profile 目录（FC 下可挂 NAS 持久化） |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 
-## 部署到阿里云函数计算(FC)
+> 浏览器指纹参数（seed/时区/语言/代理等）**不在环境变量里**，一律由客户端
+> `X-Browser-Cfg` 头按请求下发（见"协议约定"）。
 
-本镜像已针对 FC 自定义容器运行时的约束做适配：
+## 注意事项
 
-1. **启动时序(顺序式)**：浏览器先就绪、转发后才监听 `0.0.0.0:9000`。
-   FC 平台在实例创建后 **60 秒内**发起健康探测 `GET /`，要求返回
-   2xx/3xx；**首次探测失败即判定实例启动失败**。因此未就绪时绝不提前
-   监听 9000 —— 监听即代表浏览器就绪、函数启动成功。
-2. **60 秒窗口预算**：浏览器就绪上限默认 50s（`BROWSER_READY_TIMEOUT`
-   可调，需留足余量给 FC 探测）。headless + 镜像内预下载二进制，冷启动
-   通常 5~20s，余量充足。若镜像较大或 CPU 弱，建议在 FC 控制台把健康
-   检查的**首次探测延迟时间**调大（如 15~30s），让首次探测落在就绪后。
-3. **监听地址/端口**：固定 `0.0.0.0:9000`（FC 探测与请求转发都指向容器
-   9000 端口）。**不要改 `PROXY_PORT`**。
-4. **无需显示环境**：默认 headless，镜像默认不装 Xvfb（更小、启动更快）。
-5. **运行期健康检查**：启动成功后 FC 周期性探测 `GET /`；若浏览器运行中
-   崩溃自动重启，`GET /` 仍即时 200（实例存活，不会被误杀）。
-6. **优雅停机**：FC 回收实例时发送 `SIGTERM`，容器会清理浏览器进程后退出。
-
-### 部署步骤
-
-```bash
-# 1. 推镜像到阿里云 ACR(容器镜像服务), 示例:
-docker tag cloakbrowser-ws-proxy:local registry.cn-hangzhou.aliyuncs.com/<ns>/cloakbrowser:latest
-docker push registry.cn-hangzhou.aliyuncs.com/<ns>/cloakbrowser:latest
-
-# 2. FC 控制台: 创建函数 -> 使用自定义容器(Custom Container)
-#    - 镜像地址: 上面推送的 ACR 地址
-#    - 启动命令/参数: 留空(使用镜像 ENTRYPOINT)
-#    - 端口: 9000
-#    - 健康检查路径: /      (超时建议调大, 如 10s+)
-```
-
-### FC 部署注意点
-
-- **冷启动**：FC 回收无请求的按量实例后，下次调用需重新拉实例并执行
-  阶段 1（浏览器 5~20s）——期间客户端连不上 9000 属正常，平台会先等
-  健康探测通过（60s 窗口）才路由请求，因此**实例未就绪时不会收到请求**；
-  实例就绪后浏览器一定已就绪。若需浏览器长期驻留/保持登录态，配置
-  **固定(预留)实例数 ≥ 1** 避免回收。
-- **指纹与持久化**：FC 环境下只有 `/tmp` 保证可写；若需固定
-  `FINGERPRINT_SEED` 的登录态，需挂载 NAS 到 `/data` 并设
-  `PROFILE_DIR=/data/profile`。默认（不设 seed）每次冷启动都是全新临时
-  身份，无需持久化。
-- **WebSocket 长连接**：FC 自定义容器的 HTTP 触发器支持 WebSocket/长连接
-  转发（平台反向代理到容器 9000），但空闲超时/最大连接数以平台为准。
-  短任务(单页操作)影响不大；超长驻留连接建议关注平台文档或改用固定实例。
-- **出站网络**：若站点要求特定出口 IP，可在 FC 中配置 NAT/固定公网 IP，
-  并视需要设置 `PROXY` 走上游代理。
-- **资源规格**：建议内存 ≥ 1 GB（Chromium 常驻约 400~800 MB）。
-
-## 常用实践
-
-- **想要持久的"登录态/身份"**：固定 `FINGERPRINT_SEED` 并把 `/data` 挂成
-  volume（compose 已内置 `cloak-profile` 卷；FC 用 NAS）。
-- **想要每次全新身份**：不设 `FINGERPRINT_SEED`，每次启动随机 5 位指纹 +
-  临时 profile，退出自动清理。
-- **需要可视化 headed**：`ENABLE_HEADED=true` 构建 + `BROWSER_HEADLESS=false`
-  （自动拉起 Xvfb:99 + openbox）。
-- **就绪检测**：`curl -s http://127.0.0.1:9000/` 看 `browser_status`；
-  `curl -s http://127.0.0.1:9000/json/version` 返回 200 表示 CDP 可用。
+- **计费与回收**：销毁请用 `DeleteSession`（推荐，立即停实例）；不销毁时 WS
+  断开后浏览器会保留复用，按量实例由 FC 空闲回收兜底。需要浏览器长期驻留/
+  保持登录态时可配**固定（预留）实例**。
+- **持久化**：FC 环境只有 `/tmp` 保证可写；需保存登录态时把 NAS 挂到
+  `/data` 并设 `PROFILE_DIR=/data/profile`（配固定 `seed` 才有意义）。
+- **资源规格**：建议内存 ≥ 1 GB（Chromium 常驻约 400~800MB）。
+- **出站网络**：访问目标站需要固定出口 IP 时，配合 FC NAT/固定公网 IP，或
+  在配置里给 `proxy` 上游代理。
+- **多用户隔离**：同一容器按 sessionID 区分会话；不同配置的会话需要新实例
+  时，客户端 `seq` 自增即可（`fc_browser.create()` 已自动处理）。
 
 ## 文件结构
 
@@ -215,13 +260,14 @@ docker push registry.cn-hangzhou.aliyuncs.com/<ns>/cloakbrowser:latest
 Dockerfile            # GitHub Release 下载 Chromium + 系统依赖(可选 headed) + websockets
 entrypoint.sh         # headless 直通; headed 才拉起 Xvfb/openbox
 app/
-  supervisor.py       # 编排: 浏览器就绪 -> 监听 9000 -> 守护/优雅停机
-  browser.py          # remote debugging 启动 stealth Chromium + 就绪等待
-  ws_proxy.py         # HTTP/WS 代理, 0.0.0.0:9000 -> 127.0.0.1:9222
+  supervisor.py       # 编排: WS 代理先行监听 -> 浏览器懒启动门 -> 崩溃守护/优雅停机
+  browser.py          # BrowserManager: 按 sessionID 复用/切换/懒启动 stealth Chromium
+  ws_proxy.py         # HTTP/WS 代理 0.0.0.0:9000 -> 127.0.0.1:9222; /start + 双头解析
+fc_browser.py         # 客户端封装类(建会话/查询/销毁, 供 Playwright 直连)
+test_fc_browser.py    # 端到端参考示例(建会话 -> 抖音截图 -> 销毁)
 docker-compose.yml    # 本地编排 + 健康检查 + 持久化卷
 ```
 
-> 注：本仓库独立实现了一个"单浏览器 + 固定端口转发"的精简代理，未直接
-> 使用官方 `cloakserve`（它按需多实例 seed 管理，模型不同）。stealth 参数
-> 与免费版 Chromium 二进制直接取自 CloakBrowser 上游（MIT 开源、GitHub
-> Release 分发），但**不引入其 Python wrapper 的任何运行时依赖**。
+> 注：本仓库独立实现了"单实例单浏览器 + 会话亲和"的精简代理，未直接使用官方
+> `cloakserve`。stealth 参数与免费版 Chromium 二进制取自 CloakBrowser 上游
+> （MIT 开源、GitHub Release 分发），但不引入其 Python wrapper 的任何运行时依赖。
